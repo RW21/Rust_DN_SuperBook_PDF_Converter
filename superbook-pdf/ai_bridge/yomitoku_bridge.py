@@ -79,6 +79,22 @@ def detect_text_direction(blocks: List[Dict]) -> str:
         return "mixed"
 
 
+_ANALYZER_CACHE: Dict[str, Any] = {}
+
+
+def _get_analyzer(device: str):
+    """DocumentAnalyzer をデバイス毎にキャッシュして返す。
+
+    元実装はページ毎に生成しており、1ページあたり約3秒のモデルロードを
+    毎回支払っていた。同一プロセスで複数ページを処理する場合に効く。
+    """
+    analyzer = _ANALYZER_CACHE.get(device)
+    if analyzer is None:
+        analyzer = DocumentAnalyzer(device=device)
+        _ANALYZER_CACHE[device] = analyzer
+    return analyzer
+
+
 def process_image(
     input_path: Path,
     output_format: str = "json",
@@ -98,14 +114,21 @@ def process_image(
         }
 
     try:
-        # Configure device
+        # Configure device (CUDA > MPS(Apple Silicon) > CPU)
         if gpu_id is not None and torch is not None and torch.cuda.is_available():
             device = f"cuda:{gpu_id}"
+        elif (
+            gpu_id is not None
+            and torch is not None
+            and getattr(torch.backends, "mps", None) is not None
+            and torch.backends.mps.is_available()
+        ):
+            device = "mps"
         else:
             device = "cpu"
 
-        # Initialize analyzer
-        analyzer = DocumentAnalyzer(device=device)
+        # Initialize analyzer (プロセス内キャッシュ: 複数ページ処理でロードを1回に)
+        analyzer = _get_analyzer(device)
 
         # Load and process image
         # load_image returns a list of numpy arrays (for batch processing)

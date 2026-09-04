@@ -218,6 +218,9 @@ pub enum PipelineError {
     #[error("Unsupported mode: {0}")]
     UnsupportedMode(String),
 
+    #[error("Transform manifest failed: {0}")]
+    TransformManifest(#[from] crate::transform_manifest::TransformManifestError),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -520,6 +523,8 @@ pub struct PipelineResult {
     pub output_path: PathBuf,
     /// Output file size in bytes
     pub output_size: u64,
+    /// Transform manifest JSONL path, present only when the manifest was published.
+    pub transform_manifest_path: Option<PathBuf>,
 }
 
 impl PipelineResult {
@@ -531,6 +536,7 @@ impl PipelineResult {
         elapsed_seconds: f64,
         output_path: PathBuf,
         output_size: u64,
+        transform_manifest_path: Option<PathBuf>,
     ) -> Self {
         Self {
             page_count,
@@ -539,6 +545,7 @@ impl PipelineResult {
             elapsed_seconds,
             output_path,
             output_size,
+            transform_manifest_path,
         }
     }
 
@@ -602,6 +609,13 @@ impl PdfPipeline {
     pub fn get_output_path(&self, input: &Path, output_dir: &Path) -> PathBuf {
         let pdf_name = input.file_stem().unwrap_or_default().to_string_lossy();
         output_dir.join(format!("{}_converted.pdf", pdf_name))
+    }
+
+    /// Get the transform manifest path for a given input PDF
+    pub fn get_transform_manifest_path(&self, input: &Path, output_dir: &Path) -> PathBuf {
+        let mut manifest_name = input.file_stem().unwrap_or_default().to_os_string();
+        manifest_name.push(".transforms.jsonl");
+        output_dir.join(manifest_name)
     }
 
     /// Get the working directory for a PDF
@@ -808,6 +822,7 @@ impl PdfPipeline {
             elapsed,
             output_path,
             output_size,
+            None,
         ))
     }
 
@@ -2023,6 +2038,7 @@ mod tests {
             45.5,
             PathBuf::from("/output/file.pdf"),
             12345678,
+            Some(PathBuf::from("/output/file.transforms.jsonl")),
         );
 
         assert_eq!(result.page_count, 100);
@@ -2031,6 +2047,10 @@ mod tests {
         assert_eq!(result.elapsed_seconds, 45.5);
         assert_eq!(result.output_path, PathBuf::from("/output/file.pdf"));
         assert_eq!(result.output_size, 12345678);
+        assert_eq!(
+            result.transform_manifest_path,
+            Some(PathBuf::from("/output/file.transforms.jsonl"))
+        );
     }
 
     #[test]
@@ -2042,16 +2062,26 @@ mod tests {
             10.0,
             PathBuf::from("/output/test.pdf"),
             5000000,
+            None,
         );
 
         assert_eq!(result.page_count, 50);
         assert!(result.page_number_shift.is_none());
         assert!(!result.is_vertical);
+        assert!(result.transform_manifest_path.is_none());
     }
 
     #[test]
     fn test_pipeline_result_to_cache() {
-        let result = PipelineResult::new(100, Some(2), true, 45.5, PathBuf::from("/out.pdf"), 1000);
+        let result = PipelineResult::new(
+            100,
+            Some(2),
+            true,
+            45.5,
+            PathBuf::from("/out.pdf"),
+            1000,
+            None,
+        );
 
         let cache_result = result.to_cache_result();
 
@@ -2084,6 +2114,34 @@ mod tests {
         let output_path = pipeline.get_output_path(input, output_dir);
 
         assert_eq!(output_path, PathBuf::from("/output/document_converted.pdf"));
+    }
+
+    #[test]
+    fn test_pdf_pipeline_get_transform_manifest_path() {
+        let pipeline = PdfPipeline::new(PipelineConfig::default());
+        let input = Path::new("/input/document.pdf");
+        let output_dir = Path::new("/output");
+
+        let manifest_path = pipeline.get_transform_manifest_path(input, output_dir);
+
+        assert_eq!(
+            manifest_path,
+            PathBuf::from("/output/document.transforms.jsonl")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_pdf_pipeline_get_transform_manifest_path_preserves_non_utf8_stem() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let pipeline = PdfPipeline::new(PipelineConfig::default());
+        let input = PathBuf::from(std::ffi::OsString::from_vec(b"book\xff.pdf".to_vec()));
+        let manifest_path = pipeline.get_transform_manifest_path(&input, Path::new("output"));
+
+        let mut expected = b"book\xff".to_vec();
+        expected.extend_from_slice(b".transforms.jsonl");
+        assert_eq!(manifest_path.file_name().unwrap().as_bytes(), expected);
     }
 
     #[test]

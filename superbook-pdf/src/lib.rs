@@ -140,6 +140,7 @@ pub mod pipeline;
 pub mod progress;
 pub mod realesrgan;
 pub mod reprocess;
+pub mod transform_manifest;
 pub mod util;
 pub mod vertical_detect;
 #[cfg(feature = "web")]
@@ -196,6 +197,14 @@ pub use pdf_writer::{
 pub use realesrgan::{RealEsrgan, RealEsrganError, RealEsrganOptions, RealEsrganOptionsBuilder};
 pub use reprocess::{
     PageStatus, ReprocessError, ReprocessOptions, ReprocessResult, ReprocessState,
+};
+pub use transform_manifest::{
+    pending_page_record, read_transform_manifest, source_pdf_identity, validate_transform_manifest,
+    write_transform_manifest_atomic, Confidence, DeskewTransform, FiniteF64, OutputTransform,
+    PageTransformError, PageTransformRecord, PdfObjectId, RotationDegrees, RotationTransform,
+    SourceImageMetadata, SourcePdfIdentity, ToolMetadata, TransformDecision,
+    TransformManifestError, TransformManifestHeader, TransformManifestRecord,
+    TRANSFORM_MANIFEST_SCHEMA_VERSION,
 };
 pub use util::{
     clamp, ensure_dir_writable, ensure_file_exists, format_duration, format_file_size, load_image,

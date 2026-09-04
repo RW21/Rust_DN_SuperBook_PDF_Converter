@@ -161,8 +161,8 @@ pub use ai_bridge::{
 pub use cli::ServeArgs;
 pub use cli::{
     create_page_progress_bar, create_progress_bar, create_spinner, CacheInfoArgs, Cli, Commands,
-    ConvertArgs, DeblurAlgorithmCli, ExitCode, MarkdownArgs, ReprocessArgs, ShadowRemovalMode,
-    TextDirectionCli, ValidationProviderCli,
+    ConvertArgs, DeblurAlgorithmCli, ExitCode, GeometryAction, GeometryModeAction, MarkdownArgs,
+    ReprocessArgs, ShadowRemovalMode, TextDirectionCli, ValidationProviderCli,
 };
 pub use config::{
     AdvancedConfig, CleanupConfig, CliOverrides, Config, ConfigError, GeneralConfig,

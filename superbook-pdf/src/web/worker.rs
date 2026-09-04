@@ -356,6 +356,9 @@ mod tests {
         assert!(config.upscale);
         assert!(!config.ocr);
         assert!(!config.internal_resolution);
+        assert!(!config.geometry_only);
+        assert_eq!(config.rotation_action, crate::cli::GeometryAction::Apply);
+        assert_eq!(config.deskew_action, crate::cli::GeometryAction::Apply);
     }
 
     #[tokio::test]

@@ -2,7 +2,8 @@
 //!
 //! CLI entry point
 
-use clap::Parser;
+use clap::parser::ValueSource;
+use clap::{ArgMatches, CommandFactory, FromArgMatches};
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -39,10 +40,16 @@ use superbook_pdf::{
 use superbook_pdf::{ServeArgs, ServerConfig, WebServer};
 
 fn main() {
-    let cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
 
     let result = match cli.command {
-        Commands::Convert(args) => run_convert(&args),
+        Commands::Convert(args) => run_convert(
+            &args,
+            matches
+                .subcommand_matches("convert")
+                .expect("convert arguments must be present"),
+        ),
         Commands::Markdown(args) => run_markdown(&args),
         Commands::Reprocess(args) => run_reprocess(&args),
         Commands::Info => run_info(),
@@ -125,7 +132,7 @@ impl ProgressCallback for VerboseProgress {
 
 // ============ Convert Command ============
 
-fn run_convert(args: &ConvertArgs) -> Result<(), Box<dyn std::error::Error>> {
+fn run_convert(args: &ConvertArgs, matches: &ArgMatches) -> Result<(), Box<dyn std::error::Error>> {
     let start_time = Instant::now();
 
     // Validate input path
@@ -154,16 +161,19 @@ fn run_convert(args: &ConvertArgs) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Create CLI overrides from command-line arguments
-    let cli_overrides = create_cli_overrides(args);
+    let cli_overrides = create_cli_overrides(args, matches);
 
     // Merge config file with CLI arguments (CLI takes precedence)
     let pipeline_config = file_config.merge_with_cli(&cli_overrides);
+    validate_geometry_only_cli_options(args, matches, &pipeline_config)?;
     let pipeline = PdfPipeline::new(pipeline_config);
 
     if args.dry_run {
         print_execution_plan(args, &pdf_files, pipeline.config());
         return Ok(());
     }
+
+    pipeline.ensure_execution_supported()?;
 
     // Create output directory
     std::fs::create_dir_all(&args.output)?;
@@ -323,8 +333,21 @@ fn run_markdown(args: &MarkdownArgs) -> Result<(), Box<dyn std::error::Error>> {
 ///
 /// Only override config file values when CLI explicitly sets a non-default value.
 /// This allows config files to provide defaults that aren't overridden by clap defaults.
-fn create_cli_overrides(args: &ConvertArgs) -> CliOverrides {
+fn create_cli_overrides(args: &ConvertArgs, matches: &ArgMatches) -> CliOverrides {
     let mut overrides = CliOverrides::new();
+
+    if is_command_line(matches, "geometry_only") {
+        overrides.geometry_only = Some(args.geometry_only);
+    }
+    if is_command_line(matches, "geometry_action") {
+        overrides.geometry_action = args.geometry_action;
+    }
+    if is_command_line(matches, "rotation_action") {
+        overrides.rotation_action = args.rotation_action;
+    }
+    if is_command_line(matches, "deskew_action") {
+        overrides.deskew_action = args.deskew_action;
+    }
 
     // CLI defaults - only override if user explicitly changed these
     const DEFAULT_DPI: u32 = 300;
@@ -337,9 +360,13 @@ fn create_cli_overrides(args: &ConvertArgs) -> CliOverrides {
         overrides.dpi = Some(args.dpi);
     }
 
-    // Deskew: override if --no-deskew was used
-    if !args.effective_deskew() {
-        overrides.deskew = Some(false);
+    // Deskew: override only when explicitly set on the command line.
+    if is_command_line(matches, "deskew") || is_command_line(matches, "no_deskew") {
+        let enabled = args.effective_deskew();
+        overrides.deskew = Some(enabled);
+        if args.geometry_only && !enabled && overrides.deskew_action.is_none() {
+            overrides.deskew_action = Some(superbook_pdf::GeometryAction::Off);
+        }
     }
 
     // Margin trim: override if changed from default
@@ -413,6 +440,82 @@ fn create_cli_overrides(args: &ConvertArgs) -> CliOverrides {
     overrides
 }
 
+fn is_command_line(matches: &ArgMatches, id: &str) -> bool {
+    matches.value_source(id) == Some(ValueSource::CommandLine)
+}
+
+fn validate_geometry_only_cli_options(
+    args: &ConvertArgs,
+    matches: &ArgMatches,
+    config: &superbook_pdf::PipelineConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !config.geometry_only {
+        return Ok(());
+    }
+
+    let mut conflicts = Vec::new();
+    if is_command_line(matches, "ocr") && args.ocr {
+        conflicts.push("--ocr");
+    }
+    if is_command_line(matches, "upscale") && args.upscale {
+        conflicts.push("--upscale");
+    }
+    if is_command_line(matches, "deskew") && args.deskew {
+        conflicts.push("--deskew");
+    }
+    if is_command_line(matches, "margin_trim") {
+        conflicts.push("--margin-trim");
+    }
+    if is_command_line(matches, "gpu") && args.gpu {
+        conflicts.push("--gpu");
+    }
+    if is_command_line(matches, "internal_resolution") && args.internal_resolution {
+        conflicts.push("--internal-resolution");
+    }
+    if is_command_line(matches, "color_correction") && args.color_correction {
+        conflicts.push("--color-correction");
+    }
+    if is_command_line(matches, "offset_alignment") && args.offset_alignment {
+        conflicts.push("--offset-alignment");
+    }
+    if is_command_line(matches, "output_height") {
+        conflicts.push("--output-height");
+    }
+    if is_command_line(matches, "advanced") && args.advanced {
+        conflicts.push("--advanced");
+    }
+    if is_command_line(matches, "content_aware_margins") && args.content_aware_margins {
+        conflicts.push("--content-aware-margins");
+    }
+    if is_command_line(matches, "margin_safety") {
+        conflicts.push("--margin-safety");
+    }
+    if is_command_line(matches, "aggressive_trim") && args.aggressive_trim {
+        conflicts.push("--aggressive-trim");
+    }
+    if is_command_line(matches, "shadow_removal")
+        && args.shadow_removal != superbook_pdf::ShadowRemovalMode::None
+    {
+        conflicts.push("--shadow-removal");
+    }
+    if is_command_line(matches, "remove_markers") && args.remove_markers {
+        conflicts.push("--remove-markers");
+    }
+    if is_command_line(matches, "deblur") && args.deblur {
+        conflicts.push("--deblur");
+    }
+
+    if conflicts.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "geometry-only mode conflicts with explicitly enabled option(s): {}",
+            conflicts.join(", ")
+        )
+        .into())
+    }
+}
+
 /// Collect PDF files from input path (file or directory)
 fn collect_pdf_files(input: &PathBuf) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
     let mut pdf_files = Vec::new();
@@ -447,6 +550,29 @@ fn print_execution_plan(
     println!("Output: {}", args.output.display());
     println!("Files to process: {}", pdf_files.len());
     println!();
+
+    if config.geometry_only {
+        println!("Geometry-only mode: ENABLED");
+        println!("Rotation action: {}", config.rotation_action);
+        println!("Deskew action: {}", config.deskew_action);
+        println!();
+        println!("Pipeline Configuration:");
+        println!("  1. Native Page Extraction");
+        println!(
+            "  2. Rotation Analysis (action: {})",
+            config.rotation_action
+        );
+        println!("  3. Deskew Analysis (action: {})", config.deskew_action);
+        println!("  4. Transform Manifest");
+        println!("  5. Preservation Output (native page dimensions)");
+        println!();
+        println!("Files:");
+        for (i, file) in pdf_files.iter().enumerate() {
+            println!("  {}. {}", i + 1, file.display());
+        }
+        return;
+    }
+
     println!("Pipeline Configuration:");
     println!("  1. Image Extraction (DPI: {})", config.dpi);
     if config.deskew {

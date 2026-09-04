@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use thiserror::Error;
 
-use crate::cli::ConvertArgs;
+use crate::cli::{ConvertArgs, GeometryAction};
 
 // ============================================================
 // Memory Management Utilities (Phase 3 optimization)
@@ -215,6 +215,9 @@ pub enum PipelineError {
     )]
     OcrUnavailable(String),
 
+    #[error("Unsupported mode: {0}")]
+    UnsupportedMode(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -222,6 +225,23 @@ pub enum PipelineError {
 /// Pipeline configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineConfig {
+    /// Use the preservation geometry-only pipeline
+    #[serde(default)]
+    pub geometry_only: bool,
+    /// Action for 180-degree rotation analysis/application
+    #[serde(default = "default_geometry_action_apply")]
+    pub rotation_action: GeometryAction,
+    /// Whether the rotation action was explicitly resolved or configured
+    #[doc(hidden)]
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub rotation_action_configured: bool,
+    /// Action for deskew analysis/application
+    #[serde(default = "default_geometry_action_apply")]
+    pub deskew_action: GeometryAction,
+    /// Whether the deskew action was explicitly resolved or configured
+    #[doc(hidden)]
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub deskew_action_configured: bool,
     /// Output DPI
     pub dpi: u32,
     /// Enable deskew
@@ -280,6 +300,14 @@ fn default_true() -> bool {
     true
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn default_geometry_action_apply() -> GeometryAction {
+    GeometryAction::Apply
+}
+
 fn default_shadow_removal() -> String {
     "none".to_string()
 }
@@ -300,6 +328,11 @@ fn default_deblur_algorithm() -> String {
 impl Default for PipelineConfig {
     fn default() -> Self {
         Self {
+            geometry_only: false,
+            rotation_action: GeometryAction::Apply,
+            rotation_action_configured: false,
+            deskew_action: GeometryAction::Apply,
+            deskew_action_configured: false,
             dpi: 300,
             deskew: true,
             margin_trim: 0.7,
@@ -327,10 +360,29 @@ impl Default for PipelineConfig {
 }
 
 impl PipelineConfig {
+    /// Create a safe geometry-only configuration with explicit actions.
+    pub fn geometry_only(rotation_action: GeometryAction, deskew_action: GeometryAction) -> Self {
+        let mut config = Self {
+            geometry_only: true,
+            rotation_action,
+            rotation_action_configured: true,
+            deskew_action,
+            deskew_action_configured: true,
+            ..Self::default()
+        };
+        config.enforce_geometry_only_constraints();
+        config
+    }
+
     /// Create configuration from CLI convert arguments
     pub fn from_convert_args(args: &ConvertArgs) -> Self {
         let advanced = args.advanced;
-        Self {
+        let mut config = Self {
+            geometry_only: args.geometry_only,
+            rotation_action: args.effective_rotation_action(),
+            rotation_action_configured: true,
+            deskew_action: args.effective_deskew_action(),
+            deskew_action_configured: true,
             dpi: args.dpi,
             deskew: args.effective_deskew(),
             margin_trim: args.margin_trim as f64,
@@ -353,7 +405,9 @@ impl PipelineConfig {
             deblur: args.deblur,
             deblur_algorithm: format!("{:?}", args.deblur_algorithm).to_lowercase(),
             assume_japanese_book: true,
-        }
+        };
+        config.enforce_geometry_only_constraints();
+        config
     }
 
     /// Convert to JSON string for cache digest
@@ -370,6 +424,12 @@ impl PipelineConfig {
     /// Builder pattern: set deskew
     pub fn with_deskew(mut self, enabled: bool) -> Self {
         self.deskew = enabled;
+        self.deskew_action = if enabled {
+            GeometryAction::Apply
+        } else {
+            GeometryAction::Off
+        };
+        self.deskew_action_configured = true;
         self
     }
 
@@ -409,6 +469,39 @@ impl PipelineConfig {
         self.color_correction = true;
         self.offset_alignment = true;
         self
+    }
+
+    /// Force the safe effective configuration required by geometry-only mode.
+    pub fn enforce_geometry_only_constraints(&mut self) {
+        if !self.geometry_only {
+            return;
+        }
+
+        self.deskew = self.deskew_action != GeometryAction::Off;
+        self.margin_trim = 0.0;
+        self.upscale = false;
+        self.gpu = false;
+        self.internal_resolution = false;
+        self.color_correction = false;
+        self.offset_alignment = false;
+        self.output_height = 0;
+        self.ocr = false;
+        self.shadow_removal = "none".to_string();
+        self.remove_markers = false;
+        self.deblur = false;
+    }
+
+    /// Resolve preservation-safe action defaults before pipeline execution.
+    fn resolve_geometry_action_defaults(&mut self) {
+        if !self.geometry_only {
+            return;
+        }
+        if !self.rotation_action_configured {
+            self.rotation_action = GeometryAction::Report;
+        }
+        if !self.deskew_action_configured {
+            self.deskew_action = GeometryAction::Report;
+        }
     }
 }
 
@@ -483,13 +576,26 @@ pub struct PdfPipeline {
 
 impl PdfPipeline {
     /// Create a new pipeline with the given configuration
-    pub fn new(config: PipelineConfig) -> Self {
+    pub fn new(mut config: PipelineConfig) -> Self {
+        config.resolve_geometry_action_defaults();
+        config.enforce_geometry_only_constraints();
         Self { config }
     }
 
     /// Get the pipeline configuration
     pub fn config(&self) -> &PipelineConfig {
         &self.config
+    }
+
+    /// Reject pipeline modes whose safe writer path is not implemented yet.
+    pub fn ensure_execution_supported(&self) -> Result<(), PipelineError> {
+        if self.config.geometry_only {
+            return Err(PipelineError::UnsupportedMode(
+                "geometry-only conversion is not yet implemented; use --dry-run to inspect the contract"
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Get the output PDF path for a given input PDF
@@ -522,6 +628,7 @@ impl PdfPipeline {
         output_dir: &Path,
         progress: &P,
     ) -> Result<PipelineResult, PipelineError> {
+        self.ensure_execution_supported()?;
         let start_time = Instant::now();
 
         // Validate input
@@ -1754,6 +1861,96 @@ mod tests {
         // Phase 3: Memory management fields
         assert_eq!(config.max_memory_mb, 0);
         assert_eq!(config.chunk_size, 0);
+        assert!(!config.geometry_only);
+        assert_eq!(config.rotation_action, crate::cli::GeometryAction::Apply);
+        assert_eq!(config.deskew_action, crate::cli::GeometryAction::Apply);
+    }
+
+    #[test]
+    fn test_geometry_only_config_forces_unrelated_stages_off() {
+        use clap::Parser;
+
+        let cli = crate::cli::Cli::try_parse_from([
+            "superbook-pdf",
+            "convert",
+            "input.pdf",
+            "--geometry-only",
+            "--geometry-action",
+            "apply",
+            "--rotation-action",
+            "report",
+        ])
+        .unwrap();
+        let crate::cli::Commands::Convert(args) = cli.command else {
+            panic!("expected convert command");
+        };
+
+        let config = PipelineConfig::from_convert_args(&args);
+        assert!(config.geometry_only);
+        assert_eq!(config.rotation_action, crate::cli::GeometryAction::Report);
+        assert_eq!(config.deskew_action, crate::cli::GeometryAction::Apply);
+        assert!(!config.upscale);
+        assert!(!config.gpu);
+        assert!(!config.ocr);
+        assert_eq!(config.margin_trim, 0.0);
+        assert_eq!(config.shadow_removal, "none");
+        assert!(!config.deblur);
+        assert!(!config.internal_resolution);
+        assert!(!config.color_correction);
+        assert!(!config.remove_markers);
+        assert!(!config.offset_alignment);
+        assert_eq!(config.output_height, 0);
+    }
+
+    #[test]
+    fn test_geometry_only_constructor_preserves_explicit_apply_actions() {
+        let config = PipelineConfig::geometry_only(GeometryAction::Apply, GeometryAction::Apply);
+        let serialized = serde_json::to_string(&config).unwrap();
+        let round_trip: PipelineConfig = serde_json::from_str(&serialized).unwrap();
+        let pipeline = PdfPipeline::new(round_trip);
+
+        assert_eq!(pipeline.config().rotation_action, GeometryAction::Apply);
+        assert_eq!(pipeline.config().deskew_action, GeometryAction::Apply);
+    }
+
+    #[test]
+    fn test_geometry_only_pipeline_execution_is_unsupported_before_input_validation() {
+        let config = PipelineConfig {
+            geometry_only: true,
+            ..PipelineConfig::default()
+        };
+        let pipeline = PdfPipeline::new(config);
+
+        assert!(!pipeline.config().upscale);
+        assert!(!pipeline.config().gpu);
+        assert_eq!(pipeline.config().margin_trim, 0.0);
+        assert!(!pipeline.config().color_correction);
+        assert_eq!(pipeline.config().output_height, 0);
+        assert_eq!(pipeline.config().rotation_action, GeometryAction::Report);
+        assert_eq!(pipeline.config().deskew_action, GeometryAction::Report);
+
+        let result = pipeline.process(Path::new("/nonexistent/file.pdf"), Path::new("/output"));
+
+        assert!(matches!(result, Err(PipelineError::UnsupportedMode(_))));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("not yet implemented"));
+    }
+
+    #[test]
+    fn test_deserialized_geometry_only_config_without_actions_defaults_to_report() {
+        let mut value = serde_json::to_value(PipelineConfig::default()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.insert("geometry_only".to_string(), serde_json::Value::Bool(true));
+        object.remove("rotation_action");
+        object.remove("deskew_action");
+
+        let config: PipelineConfig = serde_json::from_value(value).unwrap();
+        let pipeline = PdfPipeline::new(config);
+
+        assert_eq!(pipeline.config().rotation_action, GeometryAction::Report);
+        assert_eq!(pipeline.config().deskew_action, GeometryAction::Report);
     }
 
     #[test]
@@ -1765,6 +1962,9 @@ mod tests {
         assert!(json.contains("\"dpi\":300"));
         assert!(json.contains("\"deskew\":true"));
         assert!(json.contains("\"upscale\":true"));
+        assert!(json.contains("\"geometry_only\":false"));
+        assert!(json.contains("\"rotation_action\":\"apply\""));
+        assert!(json.contains("\"deskew_action\":\"apply\""));
     }
 
     #[test]

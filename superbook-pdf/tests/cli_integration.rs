@@ -13,6 +13,255 @@ fn superbook_cmd() -> Command {
     Command::new(env!("CARGO_BIN_EXE_superbook-pdf"))
 }
 
+#[test]
+fn test_geometry_only_dry_run_defaults_to_report_actions() {
+    superbook_cmd()
+        .args([
+            "convert",
+            "tests/fixtures/sample.pdf",
+            "-o",
+            "/tmp/out",
+            "--geometry-only",
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Geometry-only mode: ENABLED"))
+        .stdout(predicate::str::contains("Rotation action: report"))
+        .stdout(predicate::str::contains("Deskew action: report"))
+        .stdout(predicate::str::contains("Native Page Extraction"))
+        .stdout(predicate::str::contains("Rotation Analysis"))
+        .stdout(predicate::str::contains("Deskew Analysis"))
+        .stdout(predicate::str::contains("Transform Manifest"))
+        .stdout(predicate::str::contains("Preservation Output"))
+        .stdout(predicate::str::contains("AI Upscaling").not())
+        .stdout(predicate::str::contains("Margin Trim").not())
+        .stdout(predicate::str::contains("Shadow Removal").not())
+        .stdout(predicate::str::contains("Deblur").not())
+        .stdout(predicate::str::contains("Internal Resolution").not())
+        .stdout(predicate::str::contains("Color Correction").not())
+        .stdout(predicate::str::contains("Marker Removal").not())
+        .stdout(predicate::str::contains("Offset Alignment").not())
+        .stdout(predicate::str::contains("OCR").not());
+}
+
+#[test]
+fn test_geometry_only_operation_actions_override_common_action() {
+    superbook_cmd()
+        .args([
+            "convert",
+            "tests/fixtures/sample.pdf",
+            "--geometry-only",
+            "--geometry-action",
+            "apply",
+            "--rotation-action",
+            "off",
+            "--deskew-action",
+            "report",
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Rotation action: off"))
+        .stdout(predicate::str::contains("Deskew action: report"));
+}
+
+#[test]
+fn test_geometry_actions_require_geometry_only_mode() {
+    for option in [
+        ["--geometry-action", "report"],
+        ["--rotation-action", "off"],
+        ["--deskew-action", "apply"],
+    ] {
+        superbook_cmd()
+            .args(["convert", "tests/fixtures/sample.pdf"])
+            .args(option)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("--geometry-only"));
+    }
+}
+
+#[test]
+fn test_geometry_action_rejects_invalid_typed_value() {
+    superbook_cmd()
+        .args([
+            "convert",
+            "tests/fixtures/sample.pdf",
+            "--geometry-only",
+            "--rotation-action",
+            "rotate",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("possible values"))
+        .stderr(predicate::str::contains("off"))
+        .stderr(predicate::str::contains("report"))
+        .stderr(predicate::str::contains("apply"));
+}
+
+#[test]
+fn test_common_geometry_action_rejects_off() {
+    superbook_cmd()
+        .args([
+            "convert",
+            "tests/fixtures/sample.pdf",
+            "--geometry-only",
+            "--geometry-action",
+            "off",
+            "--dry-run",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("possible values"))
+        .stderr(predicate::str::contains("report"))
+        .stderr(predicate::str::contains("apply"));
+}
+
+#[test]
+fn test_geometry_only_rejects_explicit_mutating_options() {
+    let conflicts: &[&[&str]] = &[
+        &["--upscale", "true"],
+        &["--gpu", "true"],
+        &["--ocr"],
+        &["--margin-trim", "1.0"],
+        &["--content-aware-margins", "true"],
+        &["--aggressive-trim"],
+        &["--shadow-removal", "auto"],
+        &["--deblur"],
+        &["--internal-resolution"],
+        &["--color-correction"],
+        &["--remove-markers"],
+        &["--offset-alignment"],
+        &["--output-height", "3508"],
+        &["--advanced"],
+    ];
+
+    for conflict in conflicts {
+        superbook_cmd()
+            .args([
+                "convert",
+                "tests/fixtures/sample.pdf",
+                "--geometry-only",
+                "--dry-run",
+            ])
+            .args(*conflict)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("--geometry-only"));
+    }
+}
+
+#[test]
+fn test_geometry_only_accepts_redundant_disabling_flags() {
+    superbook_cmd()
+        .args([
+            "convert",
+            "tests/fixtures/sample.pdf",
+            "--geometry-only",
+            "--no-upscale",
+            "--no-gpu",
+            "--no-deskew",
+            "--no-content-aware-margins",
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Deskew action: off"));
+}
+
+#[test]
+fn test_geometry_only_non_dry_run_fails_closed_before_output_creation() {
+    let temp_dir = TempDir::new().unwrap();
+    let output_dir = temp_dir.path().join("must-not-exist");
+
+    superbook_cmd()
+        .args([
+            "convert",
+            "tests/fixtures/sample.pdf",
+            "--geometry-only",
+            "-o",
+            output_dir.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not yet implemented"));
+
+    assert!(!output_dir.exists());
+}
+
+#[test]
+fn test_config_selected_geometry_only_rejects_explicit_mutating_cli_options() {
+    let temp_dir = TempDir::new().unwrap();
+    let config_path = temp_dir.path().join("geometry.toml");
+    std::fs::write(&config_path, "[processing]\ngeometry_only = true\n").unwrap();
+
+    let conflicts: &[&[&str]] = &[
+        &["--upscale", "true"],
+        &["--gpu", "true"],
+        &["--ocr"],
+        &["--deskew", "true"],
+        &["--margin-trim", "1.0"],
+        &["--content-aware-margins", "true"],
+        &["--margin-safety", "1.0"],
+        &["--aggressive-trim"],
+        &["--shadow-removal", "auto"],
+        &["--deblur"],
+        &["--internal-resolution"],
+        &["--color-correction"],
+        &["--remove-markers"],
+        &["--offset-alignment"],
+        &["--output-height", "3508"],
+        &["--advanced"],
+    ];
+
+    for conflict in conflicts {
+        superbook_cmd()
+            .args([
+                "convert",
+                "tests/fixtures/sample.pdf",
+                "--config",
+                config_path.to_str().unwrap(),
+                "--dry-run",
+            ])
+            .args(*conflict)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("geometry-only"));
+    }
+}
+
+#[test]
+fn test_redundant_geometry_only_flag_preserves_configured_actions() {
+    let temp_dir = TempDir::new().unwrap();
+    let config_path = temp_dir.path().join("geometry.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[processing]
+geometry_only = true
+geometry_action = "apply"
+rotation_action = "off"
+deskew_action = "report"
+"#,
+    )
+    .unwrap();
+
+    superbook_cmd()
+        .args([
+            "convert",
+            "tests/fixtures/sample.pdf",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--geometry-only",
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Rotation action: off"))
+        .stdout(predicate::str::contains("Deskew action: report"));
+}
+
 // TC-CLI-001: ヘルプ表示
 #[test]
 fn test_help_command() {

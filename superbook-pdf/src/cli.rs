@@ -4,6 +4,7 @@
 
 use clap::{Args, Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Exit codes for the CLI
@@ -161,6 +162,47 @@ pub enum ValidationProviderCli {
     /// Local LLM endpoint
     #[default]
     Local,
+}
+
+/// Action to take for a geometry operation
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum GeometryAction {
+    /// Disable analysis and application
+    Off,
+    /// Analyze and report without changing page pixels
+    Report,
+    /// Analyze and apply approved transforms
+    Apply,
+}
+
+impl std::fmt::Display for GeometryAction {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Off => "off",
+            Self::Report => "report",
+            Self::Apply => "apply",
+        })
+    }
+}
+
+/// Common action to apply to all geometry operations
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum GeometryModeAction {
+    /// Analyze and report without changing page pixels
+    Report,
+    /// Analyze and apply approved transforms
+    Apply,
+}
+
+impl From<GeometryModeAction> for GeometryAction {
+    fn from(action: GeometryModeAction) -> Self {
+        match action {
+            GeometryModeAction::Report => Self::Report,
+            GeometryModeAction::Apply => Self::Apply,
+        }
+    }
 }
 
 /// Arguments for the markdown command (Issue #36)
@@ -476,6 +518,42 @@ pub struct ConvertArgs {
     #[arg(long)]
     pub dry_run: bool,
 
+    /// Use the preservation geometry-only pipeline
+    #[arg(
+        long,
+        conflicts_with_all = [
+            "ocr",
+            "upscale",
+            "deskew",
+            "margin_trim",
+            "gpu",
+            "internal_resolution",
+            "color_correction",
+            "offset_alignment",
+            "output_height",
+            "advanced",
+            "content_aware_margins",
+            "margin_safety",
+            "aggressive_trim",
+            "shadow_removal",
+            "remove_markers",
+            "deblur"
+        ]
+    )]
+    pub geometry_only: bool,
+
+    /// Common geometry action (defaults to report in geometry-only mode)
+    #[arg(long, value_enum, requires = "geometry_only")]
+    pub geometry_action: Option<GeometryModeAction>,
+
+    /// Override the geometry action for 180-degree rotation
+    #[arg(long, value_enum, requires = "geometry_only")]
+    pub rotation_action: Option<GeometryAction>,
+
+    /// Override the geometry action for deskew correction
+    #[arg(long, value_enum, requires = "geometry_only")]
+    pub deskew_action: Option<GeometryAction>,
+
     // === Phase 6: Advanced processing options ===
     /// Enable internal resolution normalization (4960x7016)
     #[arg(long)]
@@ -559,6 +637,42 @@ pub struct ConvertArgs {
 }
 
 impl ConvertArgs {
+    /// Get the common action for geometry-only mode
+    pub fn effective_geometry_action(&self) -> GeometryAction {
+        self.geometry_action
+            .map(GeometryAction::from)
+            .unwrap_or(GeometryAction::Report)
+    }
+
+    /// Get the effective 180-degree rotation action
+    pub fn effective_rotation_action(&self) -> GeometryAction {
+        if self.geometry_only {
+            self.rotation_action
+                .unwrap_or_else(|| self.effective_geometry_action())
+        } else if self.effective_deskew() {
+            GeometryAction::Apply
+        } else {
+            GeometryAction::Off
+        }
+    }
+
+    /// Get the effective deskew action
+    pub fn effective_deskew_action(&self) -> GeometryAction {
+        if self.geometry_only {
+            self.deskew_action.unwrap_or_else(|| {
+                if self.effective_deskew() {
+                    self.effective_geometry_action()
+                } else {
+                    GeometryAction::Off
+                }
+            })
+        } else if self.effective_deskew() {
+            GeometryAction::Apply
+        } else {
+            GeometryAction::Off
+        }
+    }
+
     /// Get effective upscale setting (considering --no-upscale flag)
     pub fn effective_upscale(&self) -> bool {
         self.upscale && !self.no_upscale

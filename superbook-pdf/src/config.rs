@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
+use crate::cli::{GeometryAction, GeometryModeAction};
 use crate::PipelineConfig;
 
 /// Configuration file errors
@@ -66,6 +67,22 @@ pub struct ProcessingConfig {
     /// Enable deskew correction
     #[serde(default)]
     pub deskew: Option<bool>,
+
+    /// Use the preservation geometry-only pipeline
+    #[serde(default)]
+    pub geometry_only: Option<bool>,
+
+    /// Common action for geometry operations
+    #[serde(default)]
+    pub geometry_action: Option<GeometryModeAction>,
+
+    /// Override the common action for 180-degree rotation
+    #[serde(default)]
+    pub rotation_action: Option<GeometryAction>,
+
+    /// Override the common action for deskew correction
+    #[serde(default)]
+    pub deskew_action: Option<GeometryAction>,
 
     /// Margin trim percentage
     #[serde(default)]
@@ -356,12 +373,43 @@ impl Config {
             config.deblur_algorithm = algo.clone();
         }
 
+        if self.processing.geometry_only.unwrap_or(false) {
+            let common_action = self
+                .processing
+                .geometry_action
+                .map(GeometryAction::from)
+                .unwrap_or(GeometryAction::Report);
+            config.geometry_only = true;
+            config.rotation_action = self.processing.rotation_action.unwrap_or(common_action);
+            config.rotation_action_configured = true;
+            config.deskew_action = self.processing.deskew_action.unwrap_or_else(|| {
+                if self.processing.deskew == Some(false) {
+                    GeometryAction::Off
+                } else {
+                    common_action
+                }
+            });
+            config.deskew_action_configured = true;
+        } else {
+            if let Some(action) = self.processing.rotation_action {
+                config.rotation_action = action;
+                config.rotation_action_configured = true;
+            }
+            if let Some(action) = self.processing.deskew_action {
+                config.deskew_action = action;
+                config.deskew_action_configured = true;
+            }
+        }
+
+        config.enforce_geometry_only_constraints();
+
         config
     }
 
     /// Merge with CLI arguments (CLI takes precedence)
     pub fn merge_with_cli(&self, cli: &CliOverrides) -> PipelineConfig {
         let mut config = self.to_pipeline_config();
+        let was_geometry_only = config.geometry_only;
 
         // CLI overrides take precedence
         if let Some(dpi) = cli.dpi {
@@ -422,6 +470,35 @@ impl Config {
             config.deblur_algorithm = algo.clone();
         }
 
+        if let Some(geometry_only) = cli.geometry_only {
+            config.geometry_only = geometry_only;
+        }
+        if config.geometry_only {
+            if !was_geometry_only && cli.geometry_only == Some(true) {
+                config.rotation_action = GeometryAction::Report;
+                config.deskew_action = GeometryAction::Report;
+                config.rotation_action_configured = true;
+                config.deskew_action_configured = true;
+            }
+            if let Some(action) = cli.geometry_action {
+                let action = GeometryAction::from(action);
+                config.rotation_action = action;
+                config.deskew_action = action;
+                config.rotation_action_configured = true;
+                config.deskew_action_configured = true;
+            }
+            if let Some(action) = cli.rotation_action {
+                config.rotation_action = action;
+                config.rotation_action_configured = true;
+            }
+            if let Some(action) = cli.deskew_action {
+                config.deskew_action = action;
+                config.deskew_action_configured = true;
+            }
+        }
+
+        config.enforce_geometry_only_constraints();
+
         config
     }
 
@@ -440,6 +517,10 @@ impl Config {
 /// CLI override values for merging with config file
 #[derive(Debug, Clone, Default)]
 pub struct CliOverrides {
+    pub geometry_only: Option<bool>,
+    pub geometry_action: Option<GeometryModeAction>,
+    pub rotation_action: Option<GeometryAction>,
+    pub deskew_action: Option<GeometryAction>,
     pub dpi: Option<u32>,
     pub deskew: Option<bool>,
     pub margin_trim: Option<f64>,
@@ -708,6 +789,79 @@ dpi = 600
 
         let toml_str = config.to_toml().unwrap();
         assert!(toml_str.contains("dpi = 300"));
+    }
+
+    #[test]
+    fn test_geometry_config_toml_round_trip_and_safe_pipeline_conversion() {
+        let toml = r#"
+[processing]
+geometry_only = true
+geometry_action = "apply"
+rotation_action = "off"
+deskew_action = "report"
+deskew = true
+margin_trim = 2.0
+upscale = true
+gpu = true
+shadow_removal = "both"
+
+[advanced]
+internal_resolution = true
+color_correction = true
+offset_alignment = true
+output_height = 3508
+
+[ocr]
+enabled = true
+
+[cleanup]
+marker_removal = true
+deblur = true
+"#;
+
+        let config = Config::from_toml(toml).unwrap();
+        assert_eq!(
+            config.processing.geometry_action,
+            Some(crate::cli::GeometryModeAction::Apply)
+        );
+        let serialized = config.to_toml().unwrap();
+        let round_trip = Config::from_toml(&serialized).unwrap();
+        assert_eq!(round_trip, config);
+
+        let pipeline = config.to_pipeline_config();
+        assert!(pipeline.geometry_only);
+        assert_eq!(pipeline.rotation_action, crate::cli::GeometryAction::Off);
+        assert_eq!(pipeline.deskew_action, crate::cli::GeometryAction::Report);
+        assert_eq!(pipeline.margin_trim, 0.0);
+        assert!(!pipeline.upscale);
+        assert!(!pipeline.gpu);
+        assert!(!pipeline.ocr);
+        assert_eq!(pipeline.shadow_removal, "none");
+        assert!(!pipeline.deblur);
+        assert!(!pipeline.internal_resolution);
+        assert!(!pipeline.color_correction);
+        assert!(!pipeline.remove_markers);
+        assert!(!pipeline.offset_alignment);
+        assert_eq!(pipeline.output_height, 0);
+    }
+
+    #[test]
+    fn test_geometry_config_cli_no_deskew_preserves_rotation_action() {
+        let config = Config::from_toml(
+            r#"
+[processing]
+geometry_only = true
+rotation_action = "report"
+deskew_action = "report"
+"#,
+        )
+        .unwrap();
+        let cli = CliOverrides::new().with_deskew(false);
+
+        let pipeline = config.merge_with_cli(&cli);
+
+        assert_eq!(pipeline.rotation_action, GeometryAction::Report);
+        assert_eq!(pipeline.deskew_action, GeometryAction::Off);
     }
 
     #[test]

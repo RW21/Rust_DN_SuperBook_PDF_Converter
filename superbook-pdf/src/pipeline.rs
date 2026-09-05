@@ -213,6 +213,9 @@ pub enum PipelineError {
     #[error("native PDF extraction failed: {0}")]
     NativeExtraction(#[from] crate::image_extract::NativeExtractError),
 
+    #[error("geometry conversion failed: {0}")]
+    Geometry(#[from] crate::geometry_pipeline::GeometryError),
+
     #[error("Image processing failed: {0}")]
     ImageProcessingFailed(String),
 
@@ -978,25 +981,49 @@ impl PdfPipeline {
         Ok(outcome)
     }
 
-    /// Reject pipeline modes whose safe writer path is not implemented yet.
+    /// Validate platform and complete-page requirements before creating outputs.
     pub fn ensure_execution_supported(&self) -> Result<(), PipelineError> {
-        if self.config.geometry_only {
+        if self.config.geometry_only && self.config.max_pages.is_some() {
             return Err(PipelineError::UnsupportedMode(
-                "geometry-only conversion is not yet implemented; use --dry-run to inspect the contract"
+                "geometry-only requires all physical pages; max-pages is unsupported (use a separate sample PDF)"
                     .to_string(),
             ));
+        }
+        if self.config.geometry_only && !cfg!(target_os = "linux") {
+            return Err(PipelineError::UnsupportedMode(
+                "atomic geometry publication is currently supported on Linux only".into(),
+            ));
+        }
+        if self.config.geometry_only {
+            self.config.deskew_policy()?;
         }
         Ok(())
     }
 
+    pub fn get_geometry_dir(&self, input: &Path, output_dir: &Path) -> PathBuf {
+        let mut name = input.file_stem().unwrap_or_default().to_os_string();
+        name.push(".geometry");
+        output_dir.join(name)
+    }
+
     /// Get the output PDF path for a given input PDF
     pub fn get_output_path(&self, input: &Path, output_dir: &Path) -> PathBuf {
+        if self.config.geometry_only {
+            return self
+                .get_geometry_dir(input, output_dir)
+                .join("document.pdf");
+        }
         let pdf_name = input.file_stem().unwrap_or_default().to_string_lossy();
         output_dir.join(format!("{}_converted.pdf", pdf_name))
     }
 
     /// Get the transform manifest path for a given input PDF
     pub fn get_transform_manifest_path(&self, input: &Path, output_dir: &Path) -> PathBuf {
+        if self.config.geometry_only {
+            return self
+                .get_geometry_dir(input, output_dir)
+                .join("transforms.jsonl");
+        }
         let mut manifest_name = input.file_stem().unwrap_or_default().to_os_string();
         manifest_name.push(".transforms.jsonl");
         output_dir.join(manifest_name)
@@ -1028,6 +1055,45 @@ impl PdfPipeline {
     ) -> Result<PipelineResult, PipelineError> {
         self.ensure_execution_supported()?;
         let start_time = Instant::now();
+
+        if self.config.geometry_only {
+            if !input.exists() {
+                return Err(PipelineError::InputNotFound(input.to_path_buf()));
+            }
+            std::fs::create_dir_all(output_dir)?;
+            progress.on_step_start("Native geometry");
+            let published = crate::geometry_pipeline::process_geometry(
+                self,
+                input,
+                &self.get_geometry_dir(input, output_dir),
+            )?;
+            let manifest = crate::geometry_pipeline::verify_geometry_bundle(&published.directory)?;
+            let review_count = manifest
+                .pages
+                .iter()
+                .filter(|p| p.evidence.review_required)
+                .count();
+            if review_count > 0 {
+                progress.on_warning(&format!("{review_count} page(s) require review; inspect the published transform manifest before accepting corrections"));
+            }
+            progress.on_step_complete(
+                "Native geometry",
+                &format!(
+                    "{} pages published; {} require review",
+                    manifest.pages.len(),
+                    review_count
+                ),
+            );
+            return Ok(PipelineResult {
+                page_count: manifest.pages.len(),
+                page_number_shift: None,
+                is_vertical: false,
+                elapsed_seconds: start_time.elapsed().as_secs_f64(),
+                output_path: published.pdf_path,
+                output_size: manifest.header.pdf_byte_length,
+                transform_manifest_path: Some(published.manifest_path),
+            });
+        }
 
         // Validate input
         if !input.exists() {
@@ -2853,9 +2919,10 @@ mod tests {
     }
 
     #[test]
-    fn test_geometry_only_pipeline_execution_is_unsupported_before_input_validation() {
+    fn test_geometry_only_truncation_is_unsupported_before_input_validation() {
         let config = PipelineConfig {
             geometry_only: true,
+            max_pages: Some(1),
             ..PipelineConfig::default()
         };
         let pipeline = PdfPipeline::new(config);
@@ -2871,10 +2938,7 @@ mod tests {
         let result = pipeline.process(Path::new("/nonexistent/file.pdf"), Path::new("/output"));
 
         assert!(matches!(result, Err(PipelineError::UnsupportedMode(_))));
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("not yet implemented"));
+        assert!(result.unwrap_err().to_string().contains("max-pages"));
     }
 
     #[test]

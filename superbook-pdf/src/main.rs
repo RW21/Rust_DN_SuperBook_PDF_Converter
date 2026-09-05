@@ -172,6 +172,10 @@ fn run_convert(args: &ConvertArgs, matches: &ArgMatches) -> Result<(), Box<dyn s
 
     pipeline.ensure_execution_supported()?;
 
+    if pipeline.config().geometry_only && args.skip_existing {
+        return Err("--skip-existing is unsupported for immutable geometry bundles; use a new output directory".into());
+    }
+
     // Create output directory
     std::fs::create_dir_all(&args.output)?;
 
@@ -193,7 +197,7 @@ fn run_convert(args: &ConvertArgs, matches: &ArgMatches) -> Result<(), Box<dyn s
         let output_pdf = pipeline.get_output_path(pdf_path, &args.output);
 
         // Check cache for smart skipping
-        if args.skip_existing && !args.force {
+        if !pipeline.config().geometry_only && args.skip_existing && !args.force {
             if output_pdf.exists() {
                 if verbose {
                     println!(
@@ -206,7 +210,7 @@ fn run_convert(args: &ConvertArgs, matches: &ArgMatches) -> Result<(), Box<dyn s
                 skip_count += 1;
                 continue;
             }
-        } else if !args.force {
+        } else if !pipeline.config().geometry_only && !args.force {
             if let Some(cache) = should_skip_processing(pdf_path, &output_pdf, &options_json, false)
             {
                 if verbose {
@@ -238,10 +242,19 @@ fn run_convert(args: &ConvertArgs, matches: &ArgMatches) -> Result<(), Box<dyn s
                 ok_count += 1;
 
                 // Save cache after successful processing
-                if let Ok(digest) = CacheDigest::new(pdf_path, &options_json) {
-                    let cache_result = result.to_cache_result();
-                    let cache = ProcessingCache::new(digest, cache_result);
-                    let _ = cache.save(&output_pdf);
+                if !pipeline.config().geometry_only {
+                    if let Ok(digest) = CacheDigest::new(pdf_path, &options_json) {
+                        let cache_result = result.to_cache_result();
+                        let cache = ProcessingCache::new(digest, cache_result);
+                        let _ = cache.save(&output_pdf);
+                    }
+                }
+
+                if pipeline.config().geometry_only && !args.quiet {
+                    println!("PDF: {}", result.output_path.display());
+                    if let Some(path) = &result.transform_manifest_path {
+                        println!("Transforms: {}", path.display());
+                    }
                 }
 
                 if verbose {

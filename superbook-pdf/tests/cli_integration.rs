@@ -264,7 +264,7 @@ fn test_geometry_only_accepts_redundant_disabling_flags() {
 }
 
 #[test]
-fn test_geometry_only_non_dry_run_fails_closed_before_output_creation() {
+fn test_geometry_only_max_pages_fails_closed_before_output_creation() {
     let temp_dir = TempDir::new().unwrap();
     let output_dir = temp_dir.path().join("must-not-exist");
 
@@ -273,14 +273,64 @@ fn test_geometry_only_non_dry_run_fails_closed_before_output_creation() {
             "convert",
             "tests/fixtures/sample.pdf",
             "--geometry-only",
+            "--max-pages",
+            "1",
             "-o",
             output_dir.to_str().unwrap(),
         ])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("not yet implemented"));
+        .stderr(predicate::str::contains("max-pages"));
 
     assert!(!output_dir.exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_geometry_only_cli_publishes_verified_manifest_without_legacy_cache() {
+    use lopdf::{dictionary, Document, Object};
+    let dir = TempDir::new().unwrap();
+    let source = dir.path().join("blank.pdf");
+    let mut doc = Document::with_version("1.7");
+    let pages = doc.new_object_id();
+    let page=doc.add_object(dictionary!{"Type"=>"Page","Parent"=>pages,"MediaBox"=>vec![0.into(),0.into(),100.into(),100.into()]});
+    doc.objects.insert(
+        pages,
+        Object::Dictionary(dictionary! {"Type"=>"Pages","Count"=>1,"Kids"=>vec![page.into()]}),
+    );
+    let root = doc.add_object(dictionary! {"Type"=>"Catalog","Pages"=>pages});
+    doc.trailer.set("Root", root);
+    doc.save(&source).unwrap();
+    let before = std::fs::read(&source).unwrap();
+    let output = dir.path().join("out");
+    superbook_cmd()
+        .args([
+            "convert",
+            source.to_str().unwrap(),
+            "--geometry-only",
+            "-o",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Transforms:"));
+    let bundle = output.join("blank.geometry");
+    let manifest = superbook_pdf::geometry_pipeline::verify_geometry_bundle(&bundle).unwrap();
+    assert_eq!(manifest.pages.len(), 1);
+    assert!(manifest.pages[0].output.reused);
+    assert_eq!(std::fs::read_dir(&bundle).unwrap().count(), 2);
+    assert_eq!(std::fs::read(&source).unwrap(), before);
+    superbook_cmd()
+        .args([
+            "convert",
+            source.to_str().unwrap(),
+            "--geometry-only",
+            "-o",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .failure();
+    assert_eq!(std::fs::read(&source).unwrap(), before);
 }
 
 #[test]

@@ -687,7 +687,7 @@ impl ImageProcDeskewer {
                 let ox = (nx as f64 - ncx) * cos_a + (ny as f64 - ncy) * sin_a + cx;
                 let oy = -(nx as f64 - ncx) * sin_a + (ny as f64 - ncy) * cos_a + cy;
 
-                if ox >= 0.0 && ox < width as f64 - 1.0 && oy >= 0.0 && oy < height as f64 - 1.0 {
+                if ox >= 0.0 && ox < width as f64 && oy >= 0.0 && oy < height as f64 {
                     let pixel = match options.quality_mode {
                         QualityMode::Fast => Self::nearest_neighbor(img, ox, oy),
                         QualityMode::Standard => Self::lanczos(img, ox, oy),
@@ -703,7 +703,10 @@ impl ImageProcDeskewer {
 
     /// Nearest neighbor interpolation
     fn nearest_neighbor(img: &DynamicImage, x: f64, y: f64) -> Rgba<u8> {
-        img.get_pixel(x.round() as u32, y.round() as u32)
+        img.get_pixel(
+            (x.round() as u32).min(img.width().saturating_sub(1)),
+            (y.round() as u32).min(img.height().saturating_sub(1)),
+        )
     }
 
     /// Bilinear interpolation
@@ -1317,7 +1320,7 @@ impl ImageProcDeskewer {
             }
         }
 
-        if boundary_points.len() < (height / 3) as usize {
+        if boundary_points.is_empty() || boundary_points.len() < (height / 3) as usize {
             // Not enough points found
             return Ok(SkewDetection {
                 angle: 0.0,
@@ -1680,6 +1683,16 @@ impl ImageProcDeskewer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expanded_rotation_keeps_last_source_row_and_column() {
+        let image = DynamicImage::ImageLuma8(GrayImage::from_pixel(3, 3, image::Luma([0])));
+        let options = DeskewOptions::builder()
+            .quality_mode(QualityMode::HighQuality)
+            .build();
+        let output = ImageProcDeskewer::rotate_image(&image, 0.0, &options).to_rgba8();
+        assert!(output.pixels().all(|p| p.0 == [0, 0, 0, 255]));
+    }
     use image::{ImageBuffer, Luma, LumaA, Rgb, RgbaImage};
     use tempfile::tempdir;
 

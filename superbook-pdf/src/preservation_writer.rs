@@ -7,6 +7,11 @@ pub struct RasterReplacement {
     pub page_index: usize,
     pub image: DynamicImage,
 }
+/// RGBA8 deskew canvas, placed at native pixel scale without changing page boxes.
+pub struct ExpandedRasterReplacement {
+    pub page_index: usize,
+    pub image: DynamicImage,
+}
 pub struct StagedPdfReceipt {
     pub pdf_sha256: String,
     pub byte_length: u64,
@@ -35,6 +40,8 @@ pub enum PreservationWriterError {
     Unsupported(String),
     #[error("replacement dimensions differ from source; expanded deskew is not supported")]
     DimensionMismatch,
+    #[error("expanded canvas would clip visible nonwhite pixels")]
+    ExpandedCanvasWouldClip,
     #[error("saved PDF verification failed: {0}")]
     Verification(String),
     #[error(transparent)]
@@ -164,12 +171,151 @@ fn image_stream(
     );
     Ok(stream)
 }
+/// Prove that the expanded RGBA8 canvas loses no visible nonwhite pixel cells.
+/// Returned coefficients are quantized to PDF Real (f32) BEFORE the proof.
+/// White/fully transparent padding may extend beyond unchanged page boxes.
+pub fn validate_expanded_placement(
+    native: &crate::image_extract::NativePdfDocument,
+    page_index: usize,
+    image: &DynamicImage,
+) -> Result<[f64; 6], PreservationWriterError> {
+    let source = native.source_document();
+    if source.trailer.has(b"Encrypt")
+        || source.objects.values().any(|o| protected(source, o, 0))
+        || protected(source, &Object::Dictionary(source.trailer.clone()), 0)
+    {
+        return Err(PreservationWriterError::ProtectedSource);
+    }
+    let page = native
+        .pages()
+        .get(page_index)
+        .ok_or_else(|| unsupported("out-of-range page index"))?;
+    if page.review_required
+        || page.kind != crate::image_extract::NativePageKind::SingleImage
+        || page.image_invocations.len() != 1
+        || !page.physical_page.issues.is_empty()
+    {
+        return Err(unsupported(
+            "expanded replacement needs a supported pure single-image page",
+        ));
+    }
+    let inv = &page.image_invocations[0];
+    if !inv.binding.is_direct || inv.binding.resource_path.len() != 1 {
+        return Err(unsupported(
+            "expanded replacement needs a direct image binding",
+        ));
+    }
+    let [a, b, c, d, e, f] = inv.binding.placement_matrix.coordinates();
+    let det = a * d - b * c;
+    if ![a, b, c, d, e, f, det].iter().all(|v| v.is_finite()) || det <= 0.0 {
+        return Err(unsupported(
+            "placement must be finite with positive nonsingular determinant",
+        ));
+    }
+    let (old_w, old_h) = (inv.metadata.width, inv.metadata.height);
+    let (w, h) = (image.width(), image.height());
+    if old_w == 0 || old_h == 0 || w == 0 || h == 0 || w < old_w || h < old_h {
+        return Err(PreservationWriterError::DimensionMismatch);
+    }
+    let rgba = image
+        .as_rgba8()
+        .ok_or_else(|| unsupported("expanded replacement requires RGBA8"))?;
+    u64::from(w)
+        .checked_mul(u64::from(h))
+        .and_then(|n| n.checked_mul(4))
+        .filter(|n| *n <= 256 * 1024 * 1024)
+        .ok_or_else(|| unsupported("expanded replacement exceeds 256 MiB sample budget"))?;
+    native.decode_image(&inv.metadata, 256 * 1024 * 1024)?;
+    let sx = f64::from(w) / f64::from(old_w);
+    let sy = f64::from(h) / f64::from(old_h);
+    let tx = -f64::from(w - old_w) / (2.0 * f64::from(old_w));
+    let ty = -f64::from(h - old_h) / (2.0 * f64::from(old_h));
+    let matrix = [
+        a * sx,
+        b * sx,
+        c * sy,
+        d * sy,
+        a * tx + c * ty + e,
+        b * tx + d * ty + f,
+    ]
+    .map(|v| f64::from(v as f32));
+    let [a, b, c, d, e, f] = matrix;
+    let det = a * d - b * c;
+    if !matrix.iter().all(|v| v.is_finite()) || !det.is_finite() || det <= 0.0 {
+        return Err(unsupported(
+            "expanded PDF Real placement is nonfinite or degenerate",
+        ));
+    }
+    let geometry = &page.physical_page;
+    let media = geometry
+        .media_box
+        .as_ref()
+        .ok_or_else(|| unsupported("missing valid MediaBox"))?
+        .value
+        .coordinates();
+    let crop = geometry
+        .effective_crop_box()
+        .ok_or_else(|| unsupported("missing valid CropBox"))?
+        .coordinates();
+    let visible = [
+        media[0].max(crop[0]),
+        media[1].max(crop[1]),
+        media[2].min(crop[2]),
+        media[3].min(crop[3]),
+    ];
+    if visible[0] >= visible[2] || visible[1] >= visible[3] {
+        return Err(unsupported("empty MediaBox/CropBox intersection"));
+    }
+    let (mut min_x, mut min_y, mut max_x, mut max_y) = (w, h, 0, 0);
+    for (x, y, pixel) in rgba.enumerate_pixels() {
+        if pixel[3] != 0 && pixel.0[..3] != [255, 255, 255] {
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x + 1);
+            max_y = max_y.max(y + 1);
+        }
+    }
+    if min_x < max_x && min_y < max_y {
+        // Include complete pixel cells, not just centers. Forward-map all corners
+        // so rotation and skew do not weaken the conservative containment proof.
+        for x in [min_x, max_x] {
+            for y in [min_y, max_y] {
+                let u = f64::from(x) / f64::from(w);
+                let v = 1.0 - f64::from(y) / f64::from(h);
+                let px = a * u + c * v + e;
+                let py = b * u + d * v + f;
+                if !px.is_finite()
+                    || !py.is_finite()
+                    || px < visible[0]
+                    || px > visible[2]
+                    || py < visible[1]
+                    || py > visible[3]
+                {
+                    return Err(PreservationWriterError::ExpandedCanvasWouldClip);
+                }
+            }
+        }
+    }
+    Ok(matrix)
+}
+
 /// Write a new, private stage only. Decoded hashes use row-major interleaved
 /// channels (including alpha), with 16-bit samples in PDF big-endian order.
 /// Encoded image hashes cover the color stream; alpha is separately verified.
 pub fn write_staged(
     native: &crate::image_extract::NativePdfDocument,
     replacements: &[RasterReplacement],
+    output: &Path,
+) -> Result<StagedPdfReceipt, PreservationWriterError> {
+    write_staged_geometry(native, replacements, &[], output)
+}
+
+/// Write same-size and expanded replacements atomically to a private new stage.
+/// Expanded pages get private content streams; original geometry is unchanged.
+pub fn write_staged_geometry(
+    native: &crate::image_extract::NativePdfDocument,
+    replacements: &[RasterReplacement],
+    expanded: &[ExpandedRasterReplacement],
     output: &Path,
 ) -> Result<StagedPdfReceipt, PreservationWriterError> {
     match std::fs::symlink_metadata(output) {
@@ -199,6 +345,7 @@ pub fn write_staged(
     let additional = replacements
         .len()
         .checked_mul(2)
+        .and_then(|n| expanded.len().checked_mul(3).and_then(|m| n.checked_add(m)))
         .and_then(|n| u32::try_from(n).ok())
         .ok_or_else(|| unsupported("replacement object count overflow"))?;
     source
@@ -226,13 +373,23 @@ pub fn write_staged(
     }
     let mut selected = BTreeMap::new();
     for r in replacements {
-        if r.page_index >= native.pages().len() || selected.insert(r.page_index, r).is_some() {
+        if r.page_index >= native.pages().len()
+            || selected.insert(r.page_index, (&r.image, None)).is_some()
+        {
             return Err(unsupported("duplicate or out-of-range page index"));
         }
+    }
+    for r in expanded {
+        if r.page_index >= native.pages().len() || selected.contains_key(&r.page_index) {
+            return Err(unsupported("duplicate or out-of-range page index"));
+        }
+        let matrix = validate_expanded_placement(native, r.page_index, &r.image)?;
+        selected.insert(r.page_index, (&r.image, Some(matrix)));
     }
     let mut pages = Vec::new();
     let mut expected_streams = Vec::new();
     let mut changed = HashSet::new();
+    let mut changed_contents = HashSet::new();
     for (index, page) in native.pages().iter().enumerate() {
         let direct =
             if page.image_invocations.len() == 1 && page.image_invocations[0].binding.is_direct {
@@ -264,7 +421,7 @@ pub fn write_staged(
                 .as_ref()
                 .and_then(|c| c.as_str().map(str::to_owned));
         }
-        if let Some(r) = selected.get(&index) {
+        if let Some((image, placement)) = selected.get(&index) {
             let inv = direct.ok_or_else(|| {
                 unsupported("replacement needs exactly one direct image occurrence")
             })?;
@@ -280,17 +437,20 @@ pub fn write_staged(
                     "placement must be finite with positive nonsingular determinant",
                 ));
             }
-            if r.image.width() != inv.metadata.width
-                || r.image.height() != inv.metadata.height
-                || r.image.width() == 0
-                || r.image.height() == 0
+            if placement.is_none()
+                && (image.width() != inv.metadata.width
+                    || image.height() != inv.metadata.height
+                    || image.width() == 0
+                    || image.height() == 0)
             {
                 return Err(PreservationWriterError::DimensionMismatch);
             }
             // Revalidate source decode semantics rather than reinterpreting masks,
             // Decode arrays, predictors, or unsupported source color spaces.
-            native.decode_image(&inv.metadata, 256 * 1024 * 1024)?;
-            let s = samples(&r.image)?;
+            if placement.is_none() {
+                native.decode_image(&inv.metadata, 256 * 1024 * 1024)?;
+            }
+            let s = samples(image)?;
             let minimum_minor = if s.bits == 16 {
                 5
             } else if s.alpha.is_some() {
@@ -312,15 +472,10 @@ pub fn write_staged(
                 doc.version = format!("1.{minimum_minor}");
             }
             let mut stream =
-                image_stream(&s.color, r.image.width(), r.image.height(), s.bits, s.space)?;
+                image_stream(&s.color, image.width(), image.height(), s.bits, s.space)?;
             if let Some(alpha) = &s.alpha {
-                let mask = image_stream(
-                    alpha,
-                    r.image.width(),
-                    r.image.height(),
-                    s.bits,
-                    "DeviceGray",
-                )?;
+                let mask =
+                    image_stream(alpha, image.width(), image.height(), s.bits, "DeviceGray")?;
                 let id = doc.add_object(mask);
                 expected_streams.push((id, alpha.clone()));
                 stream.dict.set("SMask", id);
@@ -328,6 +483,8 @@ pub fn write_staged(
             receipt.output_image_sha256 = Some(hash(&stream.content));
             receipt.decoded_pixel_sha256 = Some(hash(&s.canonical));
             receipt.reused = false;
+            receipt.width = Some(image.width());
+            receipt.height = Some(image.height());
             receipt.bits_per_component = Some(s.bits);
             receipt.color_space = Some(format!("/{}", s.space));
             let new_id = doc.add_object(stream);
@@ -357,6 +514,29 @@ pub fn write_staged(
             doc.get_object_mut(page_id)?
                 .as_dict_mut()?
                 .set("Resources", resources);
+            if let Some(matrix) = placement {
+                // Use decimal PDF Reals and escape every name byte, including
+                // whitespace/delimiters, independently of lopdf's content writer.
+                let mut bytes = b"q\n".to_vec();
+                for value in matrix {
+                    let text = (*value as f32).to_string();
+                    write!(
+                        &mut bytes,
+                        "{text}{} ",
+                        if text.contains('.') { "" } else { ".0" }
+                    )?;
+                }
+                bytes.extend_from_slice(b"cm\n/");
+                for byte in name {
+                    write!(&mut bytes, "#{byte:02X}")?;
+                }
+                bytes.extend_from_slice(b" Do\nQ\n");
+                let content_id = doc.add_object(Stream::new(dictionary! {}, bytes));
+                doc.get_object_mut(page_id)?
+                    .as_dict_mut()?
+                    .set("Contents", content_id);
+                changed_contents.insert(page_id);
+            }
             changed.insert(page_id);
         }
         pages.push(receipt);
@@ -396,6 +576,10 @@ pub fn write_staged(
                 let mut after = actual.as_dict()?.clone();
                 before.remove(b"Resources");
                 after.remove(b"Resources");
+                if changed_contents.contains(id) {
+                    before.remove(b"Contents");
+                    after.remove(b"Contents");
+                }
                 before == after
             } else {
                 original == actual
@@ -598,6 +782,282 @@ mod tests {
         doc.save(&path).unwrap();
         let native = NativePdfExtractor::extract_path(&path).unwrap();
         (dir, native)
+    }
+    fn padded_image() -> DynamicImage {
+        let mut image = image::RgbaImage::from_pixel(4, 4, image::Rgba([255; 4]));
+        for y in 1..3 {
+            for x in 1..3 {
+                image.put_pixel(x, y, image::Rgba([0, 0, 0, 255]));
+            }
+        }
+        DynamicImage::ImageRgba8(image)
+    }
+    #[test]
+    fn expanded_center_scale_rotations_and_shared_graph() {
+        for (content, expected) in [
+            (
+                b"20 0 0 20 0 0 cm /Scan Do".as_slice(),
+                [40., 0., 0., 40., -10., -10.],
+            ),
+            (
+                b"0 20 -20 0 20 0 cm /Scan Do",
+                [0., 40., -40., 0., 30., -10.],
+            ),
+            (
+                b"0 -20 20 0 0 20 cm /Scan Do",
+                [0., -40., 40., 0., -10., 30.],
+            ),
+            (
+                b"-20 0 0 -20 20 20 cm /Scan Do",
+                [-40., 0., 0., -40., 30., 30.],
+            ),
+            (b"10 2 3 10 3 3 cm /Scan Do", [20., 4., 6., 20., -3.5, -3.]),
+        ] {
+            let (dir, native) = fixture(&[content, content], false);
+            let matrix = validate_expanded_placement(&native, 0, &padded_image()).unwrap();
+            assert_eq!(matrix, expected);
+            let out = dir.path().join("expanded.pdf");
+            let receipt = write_staged_geometry(
+                &native,
+                &[],
+                &[ExpandedRasterReplacement {
+                    page_index: 0,
+                    image: padded_image(),
+                }],
+                &out,
+            )
+            .unwrap();
+            assert_eq!(
+                (receipt.pages[0].width, receipt.pages[0].height),
+                (Some(4), Some(4))
+            );
+            assert!(receipt.pages[1].reused);
+            let after = Document::load(&out).unwrap();
+            let page_id = native.source_document().get_pages()[&1];
+            for (id, obj) in &native.source_document().objects {
+                if *id != page_id {
+                    assert_eq!(after.objects.get(id), Some(obj));
+                }
+            }
+            let before = native.source_document().get_dictionary(page_id).unwrap();
+            let page = after.get_dictionary(page_id).unwrap();
+            for key in [b"MediaBox".as_slice(), b"CropBox", b"Rotate"] {
+                assert_eq!(before.get(key).ok(), page.get(key).ok());
+            }
+            assert_ne!(
+                before.get(b"Contents").unwrap(),
+                page.get(b"Contents").unwrap()
+            );
+            let content =
+                lopdf::content::Content::decode(&after.get_page_content(page_id).unwrap()).unwrap();
+            assert_eq!(
+                content
+                    .operations
+                    .iter()
+                    .map(|op| op.operator.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["q", "cm", "Do", "Q"]
+            );
+            assert_eq!(
+                content.operations[1].operands,
+                expected.map(|v| Object::Real(v as f32)).to_vec()
+            );
+        }
+    }
+    #[test]
+    fn expanded_black_margin_rejected_without_stage_white_or_transparent_allowed() {
+        let (dir, native) = fixture(&[b"20 0 0 20 0 0 cm /Scan Do"], false);
+        let mut image = padded_image().into_rgba8();
+        image.put_pixel(0, 0, image::Rgba([0, 0, 0, 255]));
+        let out = dir.path().join("clip.pdf");
+        assert!(matches!(
+            write_staged_geometry(
+                &native,
+                &[],
+                &[ExpandedRasterReplacement {
+                    page_index: 0,
+                    image: DynamicImage::ImageRgba8(image.clone()),
+                }],
+                &out
+            ),
+            Err(PreservationWriterError::ExpandedCanvasWouldClip)
+        ));
+        assert!(!out.exists());
+        image.put_pixel(0, 0, image::Rgba([0, 0, 0, 0]));
+        assert!(validate_expanded_placement(&native, 0, &DynamicImage::ImageRgba8(image)).is_ok());
+        assert!(validate_expanded_placement(&native, 0, &padded_image()).is_ok());
+    }
+    #[test]
+    fn expanded_rejects_invalid_modes_dimensions_and_cross_list_duplicates() {
+        let (dir, native) = fixture(&[b"20 0 0 20 0 0 cm /Scan Do"], false);
+        for image in [
+            DynamicImage::new_rgb8(4, 4),
+            DynamicImage::new_rgba16(4, 4),
+            DynamicImage::new_rgba8(1, 4),
+            DynamicImage::new_rgba8(0, 4),
+        ] {
+            assert!(validate_expanded_placement(&native, 0, &image).is_err());
+        }
+        let out = dir.path().join("duplicate.pdf");
+        assert!(write_staged_geometry(
+            &native,
+            &[RasterReplacement {
+                page_index: 0,
+                image: DynamicImage::new_luma8(2, 2)
+            }],
+            &[ExpandedRasterReplacement {
+                page_index: 0,
+                image: padded_image()
+            }],
+            &out
+        )
+        .is_err());
+        assert!(!out.exists());
+    }
+    #[test]
+    fn expanded_quantizes_before_proving_pixel_cell_containment() {
+        let (dir, native) = fixture(&[b"20 0 0 20 0 0 cm /Scan Do"], false);
+        let mut source = native.source_document().clone();
+        let id = &native.pages()[0].image_invocations[0].metadata.object_id;
+        source.objects.insert(
+            (id.object_number, id.generation),
+            Object::Stream(image_stream(&[1, 2, 3, 4, 5, 6], 3, 2, 8, "DeviceGray").unwrap()),
+        );
+        let path = dir.path().join("three-wide.pdf");
+        save_graph(&source, &mut std::fs::File::create(&path).unwrap()).unwrap();
+        let native = NativePdfExtractor::extract_path(&path).unwrap();
+        let mut rgba = image::RgbaImage::from_pixel(5, 4, image::Rgba([255; 4]));
+        let matrix =
+            validate_expanded_placement(&native, 0, &DynamicImage::ImageRgba8(rgba.clone()))
+                .unwrap();
+        assert_eq!(matrix[0], f64::from((20.0_f64 * (5.0 / 3.0)) as f32));
+        assert_eq!(matrix[4], f64::from((-20.0_f64 / 3.0) as f32));
+        assert!(matrix[0] / 5.0 + matrix[4] < 0.0);
+        // Mathematically centered source starts at zero; quantized cm moves its
+        // left cell boundary slightly outside. Do not hide this with an epsilon.
+        for y in 1..3 {
+            for x in 1..4 {
+                rgba.put_pixel(x, y, image::Rgba([0, 0, 0, 255]));
+            }
+        }
+        assert!(matches!(
+            validate_expanded_placement(&native, 0, &DynamicImage::ImageRgba8(rgba)),
+            Err(PreservationWriterError::ExpandedCanvasWouldClip)
+        ));
+    }
+    #[test]
+    fn expanded_intersects_crop_media_and_preserves_shared_contents() {
+        let content = b"20 0 0 20 0 0 cm /Scan Do".as_slice();
+        let (dir, native) = fixture(&[content, content], false);
+        let mut source = native.source_document().clone();
+        let ids = source.get_pages();
+        let shared = source
+            .get_dictionary(ids[&1])
+            .unwrap()
+            .get(b"Contents")
+            .unwrap()
+            .clone();
+        source
+            .get_object_mut(ids[&2])
+            .unwrap()
+            .as_dict_mut()
+            .unwrap()
+            .set("Contents", shared);
+        source
+            .get_object_mut(ids[&1])
+            .unwrap()
+            .as_dict_mut()
+            .unwrap()
+            .set(
+                "CropBox",
+                vec![(-10).into(), (-10).into(), 10.into(), 10.into()],
+            );
+        let path = dir.path().join("crop-shared.pdf");
+        save_graph(&source, &mut std::fs::File::create(&path).unwrap()).unwrap();
+        let native = NativePdfExtractor::extract_path(&path).unwrap();
+        let mut rgba = image::RgbaImage::from_pixel(4, 4, image::Rgba([255; 4]));
+        // Top-down pixel (1,2) covers PDF [0,0,10,10], the intersection.
+        rgba.put_pixel(1, 2, image::Rgba([0, 0, 0, 1]));
+        let out = dir.path().join("stage.pdf");
+        write_staged_geometry(
+            &native,
+            &[],
+            &[ExpandedRasterReplacement {
+                page_index: 0,
+                image: DynamicImage::ImageRgba8(rgba.clone()),
+            }],
+            &out,
+        )
+        .unwrap();
+        let after = Document::load(out).unwrap();
+        for (id, object) in &native.source_document().objects {
+            if *id != ids[&1] {
+                assert_eq!(after.objects.get(id), Some(object));
+            }
+        }
+        let page = after.get_dictionary(ids[&1]).unwrap();
+        for key in [b"MediaBox".as_slice(), b"CropBox", b"Rotate"] {
+            assert_eq!(
+                page.get(key).unwrap(),
+                native
+                    .source_document()
+                    .get_dictionary(ids[&1])
+                    .unwrap()
+                    .get(key)
+                    .unwrap()
+            );
+        }
+        rgba.put_pixel(0, 3, image::Rgba([0, 0, 0, 255])); // inside CropBox but outside MediaBox
+        assert!(matches!(
+            validate_expanded_placement(&native, 0, &DynamicImage::ImageRgba8(rgba)),
+            Err(PreservationWriterError::ExpandedCanvasWouldClip)
+        ));
+        assert!(matches!(
+            validate_expanded_placement(&native, 0, &padded_image()),
+            Err(PreservationWriterError::ExpandedCanvasWouldClip)
+        )); // inside MediaBox but outside CropBox
+    }
+    #[test]
+    fn expanded_rejects_review_singular_reflection_and_protected_sources() {
+        for content in [
+            b"/Scan Do /Scan Do".as_slice(),
+            b"0 0 0 20 0 0 cm /Scan Do",
+            b"-20 0 0 20 20 0 cm /Scan Do",
+            b"0 0 10 10 re f /Scan Do",
+        ] {
+            let (dir, native) = fixture(&[content], false);
+            let out = dir.path().join("stage.pdf");
+            assert!(write_staged_geometry(
+                &native,
+                &[],
+                &[ExpandedRasterReplacement {
+                    page_index: 0,
+                    image: padded_image()
+                }],
+                &out
+            )
+            .is_err());
+            assert!(!out.exists());
+        }
+        let (dir, native) = fixture(&[b"20 0 0 20 0 0 cm /Scan Do"], true);
+        assert!(matches!(
+            validate_expanded_placement(&native, 0, &padded_image()),
+            Err(PreservationWriterError::ProtectedSource)
+        ));
+        let out = dir.path().join("stage.pdf");
+        assert!(matches!(
+            write_staged_geometry(
+                &native,
+                &[],
+                &[ExpandedRasterReplacement {
+                    page_index: 0,
+                    image: padded_image()
+                }],
+                &out
+            ),
+            Err(PreservationWriterError::ProtectedSource)
+        ));
+        assert!(!out.exists());
     }
     #[test]
     fn unchanged_mixed_blank_graph_and_shared_image() {

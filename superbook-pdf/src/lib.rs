@@ -126,6 +126,8 @@ pub mod config;
 pub mod deskew;
 pub mod figure_detect;
 pub mod finalize;
+mod geometry_analysis;
+pub mod geometry_pipeline;
 pub mod image_extract;
 pub mod manifest;
 pub mod margin;

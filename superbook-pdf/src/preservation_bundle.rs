@@ -96,7 +96,7 @@ pub struct PublishedBundle {
 fn invalid(message: &str) -> BundleError {
     BundleError::Invalid(message.into())
 }
-fn hash_file(path: &Path) -> Result<(String, u64), BundleError> {
+pub(crate) fn hash_file(path: &Path) -> Result<(String, u64), BundleError> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.file_type().is_file() {
         return Err(invalid("expected regular file"));
@@ -117,7 +117,7 @@ fn hash_file(path: &Path) -> Result<(String, u64), BundleError> {
     }
     Ok((format!("{:x}", digest.finalize()), length))
 }
-fn valid_hash(value: &str) -> bool {
+pub(crate) fn valid_hash(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()
@@ -388,7 +388,10 @@ pub fn verify_bundle(directory: &Path) -> Result<OutputManifest, BundleError> {
     Ok(manifest)
 }
 
-fn decoded_receipt_hash(doc: &lopdf::Document, id: lopdf::ObjectId) -> Result<String, BundleError> {
+pub(crate) fn decoded_receipt_hash(
+    doc: &lopdf::Document,
+    id: lopdf::ObjectId,
+) -> Result<String, BundleError> {
     let stream = doc
         .get_object(id)
         .and_then(lopdf::Object::as_stream)
@@ -497,7 +500,7 @@ fn decoded_receipt_hash(doc: &lopdf::Document, id: lopdf::ObjectId) -> Result<St
     Ok(format!("{:x}", digest.finalize()))
 }
 
-fn image_identity(m: &crate::image_extract::NativeImageMetadata) -> ImageIdentity {
+pub(crate) fn image_identity(m: &crate::image_extract::NativeImageMetadata) -> ImageIdentity {
     ImageIdentity {
         object_number: m.object_id.object_number,
         generation: m.object_id.generation,
@@ -581,12 +584,12 @@ pub fn write_preservation_bundle(
 }
 
 #[cfg(target_os = "linux")]
-fn publish_directory(from: &Path, to: &Path) -> Result<(), BundleError> {
+pub(crate) fn publish_directory(from: &Path, to: &Path) -> Result<(), BundleError> {
     use rustix::fs::{renameat_with, RenameFlags, CWD};
     renameat_with(CWD, from, CWD, to, RenameFlags::NOREPLACE).map_err(|e| BundleError::Io(e.into()))
 }
 #[cfg(not(target_os = "linux"))]
-fn publish_directory(_from: &Path, _to: &Path) -> Result<(), BundleError> {
+pub(crate) fn publish_directory(_from: &Path, _to: &Path) -> Result<(), BundleError> {
     Err(BundleError::UnsupportedPlatform)
 }
 

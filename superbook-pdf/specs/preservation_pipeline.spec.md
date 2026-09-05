@@ -385,6 +385,44 @@ is implemented and tested. The writer must reload staged output and verify page 
 page geometry, unchanged object IDs and encoded hashes, and changed decoded-raster hashes
 before any transform can become `applied` or any PDF/manifest pair can be published.
 
+## Task 6A: Verified Native-Raster Writer and Output Bundle
+
+The writer is separate from the legacy JPEG/PDF renderer. It clones the complete
+parsed native source document; it never globally recompresses, prunes, renumbers,
+or rewrites unchanged page contents. Explicit prepared raster replacements are
+accepted only for unambiguous supported direct-image pages. Their dimensions must
+match the source raster exactly. Shared image objects and resources are not modified;
+only a page-local resource binding points to a new losslessly encoded image.
+
+Gray/RGB and alpha variants at 8/16 bits are encoded with explicit Flate dictionaries;
+16-bit samples use PDF big-endian order and alpha uses a lossless SMask. The PDF
+header version is promoted when necessary: at least 1.2 for escaped names, 1.4 for
+soft masks, and 1.5 for 16-bit images. Unchanged
+bilevel/CCITT streams remain encoded byte-identical. There is no JPEG fallback and
+no implicit resize, crop, DPI setting, or color conversion. Expanded deskew rasters
+are explicitly rejected by this initial writer rather than stretched or clipped.
+Signed/encrypted inputs are rejected. Source files and existing outputs are never
+overwritten. Output is reloaded and checked against the source object graph and
+expected decoded samples before a write receipt is returned.
+
+The output-bundle coordinator stages `document.pdf` and `output-manifest.jsonl` in
+one same-parent temporary directory. Its version-2 preservation-output audit format
+has a header and exactly one ordered page record per physical source page. It records
+source/output hashes, source page identities/geometry and all discovered image hashes,
+review issues, and the writer's verified pixel receipts. It does not alter the strict
+version-1 transform-manifest reader or claim that a prepared raster replacement is an
+automatically approved rotation or deskew. The output reader explicitly rejects other
+versions and validates page cardinality, indexes, hash syntax, and output file hashes.
+Both staged files are synced and read back before publication. On Linux, publication
+uses an atomic no-replace directory rename; other platforms fail closed until an
+equivalent reviewed primitive is implemented. A parent-directory sync failure after
+rename is reported as a durability uncertainty with the published path, not success.
+
+Task 6A provides a working writer/output audit API, not the automatic geometry dispatcher.
+CLI geometry application remains fail-closed until policy outcomes are bound to these
+verified receipts and the expanded-deskew placement contract is implemented. No real
+scan qualification or source modifications are part of the synthetic writer tests.
+
 ### Transform manifest test cases
 
 - Serde round-trip preserves every schema field and snake-case decisions.

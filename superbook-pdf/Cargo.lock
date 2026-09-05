@@ -2370,6 +2370,7 @@ dependencies = [
  "printpdf",
  "rayon",
  "rust-embed",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",

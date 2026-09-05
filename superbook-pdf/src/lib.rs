@@ -137,6 +137,8 @@ pub mod parallel;
 pub mod pdf_reader;
 pub mod pdf_writer;
 pub mod pipeline;
+pub mod preservation_bundle;
+pub mod preservation_writer;
 pub mod progress;
 pub mod realesrgan;
 pub mod reprocess;

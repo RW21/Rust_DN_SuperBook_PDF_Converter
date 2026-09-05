@@ -78,6 +78,9 @@ base64 = "0.22"           # Base64 encoding for preview images
 default = []
 web = ["axum", "tokio", "tower", "tower-http", "uuid", "rust-embed", "dashmap"]
 
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1", features = ["fs"] }
+
 [dev-dependencies]
 tempfile = "3"
 assert_cmd = "2"

@@ -53,6 +53,14 @@ pub const DEFAULT_ROTATION_MAXIMUM_DENSE_ROW_FRACTION: f64 = 0.75;
 pub const DEFAULT_ROTATION_MINIMUM_APPLY_SCORE: f64 = 0.55;
 /// Default minimum confidence required to approve a 180-degree proposal.
 pub const DEFAULT_ROTATION_MINIMUM_APPLY_CONFIDENCE: f64 = 0.90;
+/// Conservative maximum deskew correction angle in degrees.
+pub const DEFAULT_DESKEW_MAX_ANGLE: f64 = 5.0;
+/// Minimum confidence required for automatic deskew.
+pub const DEFAULT_DESKEW_MIN_CONFIDENCE: f64 = 0.90;
+/// Minimum detector feature count required for automatic deskew.
+pub const DEFAULT_DESKEW_MIN_FEATURES: usize = 100;
+/// Angles at or below this magnitude are treated as no-ops.
+pub const DEFAULT_DESKEW_NOOP_ANGLE: f64 = 0.10;
 
 /// Validated minimum confidence for automatic 180-degree rotation.
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
@@ -116,6 +124,216 @@ impl<'de> Deserialize<'de> for RotationConfidenceThreshold {
     }
 }
 
+macro_rules! define_deskew_float_setting {
+    ($name:ident, $label:literal, $default:expr, $valid:expr, $constraint:literal) => {
+        #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+        pub struct $name(f64);
+
+        impl $name {
+            pub fn new(value: f64) -> Result<Self> {
+                if value.is_finite() && ($valid)(value) {
+                    Ok(Self(if value == 0.0 { 0.0 } else { value }))
+                } else {
+                    Err(DeskewError::DetectionFailed(format!(
+                        concat!($label, " must be ", $constraint, ", got {}"),
+                        value
+                    )))
+                }
+            }
+
+            pub const fn get(self) -> f64 {
+                self.0
+            }
+        }
+
+        impl Default for $name {
+            fn default() -> Self {
+                Self($default)
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.0.fmt(formatter)
+            }
+        }
+
+        impl FromStr for $name {
+            type Err = String;
+
+            fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+                let parsed = value
+                    .parse::<f64>()
+                    .map_err(|error| format!(concat!("invalid ", $label, ": {}"), error))?;
+                Self::new(parsed).map_err(|error| error.to_string())
+            }
+        }
+
+        impl Serialize for $name {
+            fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+            where
+                S: Serializer,
+            {
+                serializer.serialize_f64(self.0)
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                let value = f64::deserialize(deserializer)?;
+                Self::new(value).map_err(D::Error::custom)
+            }
+        }
+    };
+}
+
+define_deskew_float_setting!(
+    DeskewMaxAngle,
+    "deskew maximum angle",
+    DEFAULT_DESKEW_MAX_ANGLE,
+    |value: f64| value > 0.0 && value <= DEFAULT_MAX_ANGLE,
+    "finite and in 0.0..=15.0 with zero excluded"
+);
+define_deskew_float_setting!(
+    DeskewMinConfidence,
+    "deskew minimum confidence",
+    DEFAULT_DESKEW_MIN_CONFIDENCE,
+    |value: f64| (0.0..=1.0).contains(&value),
+    "finite and in 0.0..=1.0"
+);
+define_deskew_float_setting!(
+    DeskewNoopAngle,
+    "deskew no-op angle",
+    DEFAULT_DESKEW_NOOP_ANGLE,
+    |value: f64| (0.0..=DEFAULT_MAX_ANGLE).contains(&value),
+    "finite and in 0.0..=15.0"
+);
+
+/// Validated nonzero detector feature-count threshold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct DeskewMinFeatures(usize);
+
+impl DeskewMinFeatures {
+    pub fn new(value: usize) -> Result<Self> {
+        if value == 0 {
+            Err(DeskewError::DetectionFailed(
+                "deskew minimum feature count must be greater than zero".to_string(),
+            ))
+        } else {
+            Ok(Self(value))
+        }
+    }
+
+    pub const fn get(self) -> usize {
+        self.0
+    }
+}
+
+impl Default for DeskewMinFeatures {
+    fn default() -> Self {
+        Self(DEFAULT_DESKEW_MIN_FEATURES)
+    }
+}
+
+impl std::fmt::Display for DeskewMinFeatures {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl FromStr for DeskewMinFeatures {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        let parsed = value
+            .parse::<usize>()
+            .map_err(|error| format!("invalid deskew minimum feature count: {error}"))?;
+        Self::new(parsed).map_err(|error| error.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for DeskewMinFeatures {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = usize::deserialize(deserializer)?;
+        Self::new(value).map_err(D::Error::custom)
+    }
+}
+
+/// Cross-field validated conservative deskew policy.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeskewPolicyOptions {
+    maximum_angle: DeskewMaxAngle,
+    minimum_confidence: DeskewMinConfidence,
+    minimum_features: DeskewMinFeatures,
+    noop_angle: DeskewNoopAngle,
+}
+
+impl<'de> Deserialize<'de> for DeskewPolicyOptions {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Fields {
+            maximum_angle: DeskewMaxAngle,
+            minimum_confidence: DeskewMinConfidence,
+            minimum_features: DeskewMinFeatures,
+            noop_angle: DeskewNoopAngle,
+        }
+
+        let fields = Fields::deserialize(deserializer)?;
+        Self::new(
+            fields.maximum_angle,
+            fields.minimum_confidence,
+            fields.minimum_features,
+            fields.noop_angle,
+        )
+        .map_err(D::Error::custom)
+    }
+}
+
+impl DeskewPolicyOptions {
+    pub fn new(
+        maximum_angle: DeskewMaxAngle,
+        minimum_confidence: DeskewMinConfidence,
+        minimum_features: DeskewMinFeatures,
+        noop_angle: DeskewNoopAngle,
+    ) -> Result<Self> {
+        if noop_angle.get() >= maximum_angle.get() {
+            return Err(DeskewError::DetectionFailed(
+                "deskew no-op angle must be smaller than the maximum angle".to_string(),
+            ));
+        }
+        Ok(Self {
+            maximum_angle,
+            minimum_confidence,
+            minimum_features,
+            noop_angle,
+        })
+    }
+
+    pub const fn maximum_angle(self) -> DeskewMaxAngle {
+        self.maximum_angle
+    }
+    pub const fn minimum_confidence(self) -> DeskewMinConfidence {
+        self.minimum_confidence
+    }
+    pub const fn minimum_features(self) -> DeskewMinFeatures {
+        self.minimum_features
+    }
+    pub const fn noop_angle(self) -> DeskewNoopAngle {
+        self.noop_angle
+    }
+}
+
 // ============================================================
 // Error Types
 // ============================================================
@@ -144,6 +362,38 @@ pub type Result<T> = std::result::Result<T, DeskewError>;
 // ============================================================
 // Options and Enums
 // ============================================================
+
+/// Stable reason for a deskew proposal or abstention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeskewReason {
+    Disabled,
+    BlankPage,
+    WithinNoopThreshold,
+    AngleOutsideLimit,
+    InsufficientConfidence,
+    InsufficientFeatures,
+    CorrectionEvidence,
+}
+
+impl DeskewReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::BlankPage => "blank_page",
+            Self::WithinNoopThreshold => "within_noop_threshold",
+            Self::AngleOutsideLimit => "angle_outside_limit",
+            Self::InsufficientConfidence => "insufficient_confidence",
+            Self::InsufficientFeatures => "insufficient_features",
+            Self::CorrectionEvidence => "correction_evidence",
+        }
+    }
+}
+
+impl std::fmt::Display for DeskewReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
 
 /// Stable reason for a rotation proposal or abstention.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -694,7 +944,7 @@ impl DeskewOptionsBuilder {
 // ============================================================
 
 /// Skew detection result
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SkewDetection {
     /// Detected angle in degrees (positive = clockwise)
     pub angle: f64,
@@ -702,6 +952,32 @@ pub struct SkewDetection {
     pub confidence: f64,
     /// Number of features used for detection
     pub feature_count: usize,
+}
+
+impl SkewDetection {
+    pub fn try_new(angle: f64, confidence: f64, feature_count: usize) -> Result<Self> {
+        let detection = Self {
+            angle: if angle == 0.0 { 0.0 } else { angle },
+            confidence: if confidence == 0.0 { 0.0 } else { confidence },
+            feature_count,
+        };
+        detection.validate()?;
+        Ok(detection)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if !self.angle.is_finite() {
+            return Err(DeskewError::DetectionFailed(
+                "deskew angle must be finite".to_string(),
+            ));
+        }
+        if !self.confidence.is_finite() || !(0.0..=1.0).contains(&self.confidence) {
+            return Err(DeskewError::DetectionFailed(
+                "deskew confidence must be finite and in 0.0..=1.0".to_string(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Deskew operation result
@@ -814,6 +1090,137 @@ mod tests {
         assert_eq!(detection.angle, 2.5);
         assert_eq!(detection.confidence, 0.95);
         assert_eq!(detection.feature_count, 150);
+    }
+
+    #[test]
+    fn deskew_policy_defaults_are_conservative_and_valid() {
+        let policy = DeskewPolicyOptions::default();
+        assert_eq!(policy.maximum_angle().get(), 5.0);
+        assert_eq!(policy.minimum_confidence().get(), 0.90);
+        assert_eq!(policy.minimum_features().get(), 100);
+        assert_eq!(policy.noop_angle().get(), 0.10);
+        DeskewPolicyOptions::new(
+            policy.maximum_angle(),
+            policy.minimum_confidence(),
+            policy.minimum_features(),
+            policy.noop_angle(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn deskew_policy_settings_reject_invalid_parse_and_serde_values() {
+        for value in ["0", "-1", "15.1", "NaN", "inf"] {
+            assert!(value.parse::<DeskewMaxAngle>().is_err(), "{value}");
+        }
+        for value in ["-0.1", "1.1", "NaN", "inf"] {
+            assert!(value.parse::<DeskewMinConfidence>().is_err(), "{value}");
+        }
+        for value in ["-0.1", "15.1", "NaN", "inf"] {
+            assert!(value.parse::<DeskewNoopAngle>().is_err(), "{value}");
+        }
+        assert!("0".parse::<DeskewMinFeatures>().is_err());
+
+        for json in ["0", "-1", "15.1", "null", "\"5\""] {
+            assert!(serde_json::from_str::<DeskewMaxAngle>(json).is_err());
+        }
+        for json in ["-0.1", "1.1", "null", "\"0.9\""] {
+            assert!(serde_json::from_str::<DeskewMinConfidence>(json).is_err());
+        }
+        assert!(serde_json::from_str::<DeskewMinFeatures>("0").is_err());
+
+        let maximum = DeskewMaxAngle::new(5.0).unwrap();
+        let confidence = DeskewMinConfidence::new(0.95).unwrap();
+        let features = DeskewMinFeatures::new(120).unwrap();
+        let noop = DeskewNoopAngle::new(0.2).unwrap();
+        assert_eq!(
+            serde_json::from_str::<DeskewMaxAngle>(&serde_json::to_string(&maximum).unwrap())
+                .unwrap(),
+            maximum
+        );
+        assert_eq!(
+            serde_json::from_str::<DeskewMinConfidence>(
+                &serde_json::to_string(&confidence).unwrap()
+            )
+            .unwrap(),
+            confidence
+        );
+        assert_eq!(
+            serde_json::from_str::<DeskewMinFeatures>(&serde_json::to_string(&features).unwrap())
+                .unwrap(),
+            features
+        );
+        assert_eq!(
+            serde_json::from_str::<DeskewNoopAngle>(&serde_json::to_string(&noop).unwrap())
+                .unwrap(),
+            noop
+        );
+    }
+
+    #[test]
+    fn deskew_policy_rejects_noop_not_below_maximum() {
+        let confidence = DeskewMinConfidence::default();
+        let features = DeskewMinFeatures::default();
+        for noop in [5.0, 6.0] {
+            assert!(DeskewPolicyOptions::new(
+                DeskewMaxAngle::new(5.0).unwrap(),
+                confidence,
+                features,
+                DeskewNoopAngle::new(noop).unwrap(),
+            )
+            .is_err());
+        }
+
+        let invalid_json = r#"{
+            "maximum_angle": 5.0,
+            "minimum_confidence": 0.9,
+            "minimum_features": 100,
+            "noop_angle": 5.0
+        }"#;
+        assert!(serde_json::from_str::<DeskewPolicyOptions>(invalid_json).is_err());
+        let encoded = serde_json::to_string(&DeskewPolicyOptions::default()).unwrap();
+        assert_eq!(
+            serde_json::from_str::<DeskewPolicyOptions>(&encoded).unwrap(),
+            DeskewPolicyOptions::default()
+        );
+    }
+
+    #[test]
+    fn skew_detection_rejects_invalid_public_evidence() {
+        for angle in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(SkewDetection::try_new(angle, 1.0, 100).is_err());
+        }
+        for confidence in [f64::NAN, f64::INFINITY, -0.1, 1.1] {
+            assert!(SkewDetection::try_new(1.0, confidence, 100).is_err());
+        }
+        assert_eq!(
+            SkewDetection::try_new(-0.0, -0.0, 0).unwrap(),
+            SkewDetection {
+                angle: 0.0,
+                confidence: 0.0,
+                feature_count: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn deskew_reasons_have_stable_names() {
+        let cases = [
+            (DeskewReason::Disabled, "disabled"),
+            (DeskewReason::BlankPage, "blank_page"),
+            (DeskewReason::WithinNoopThreshold, "within_noop_threshold"),
+            (DeskewReason::AngleOutsideLimit, "angle_outside_limit"),
+            (
+                DeskewReason::InsufficientConfidence,
+                "insufficient_confidence",
+            ),
+            (DeskewReason::InsufficientFeatures, "insufficient_features"),
+            (DeskewReason::CorrectionEvidence, "correction_evidence"),
+        ];
+        for (reason, expected) in cases {
+            assert_eq!(reason.as_str(), expected);
+            assert_eq!(reason.to_string(), expected);
+        }
     }
 
     #[test]

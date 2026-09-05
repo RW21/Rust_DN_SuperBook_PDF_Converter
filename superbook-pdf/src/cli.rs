@@ -7,7 +7,10 @@ use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-use crate::deskew::RotationConfidenceThreshold;
+use crate::deskew::{
+    DeskewMaxAngle, DeskewMinConfidence, DeskewMinFeatures, DeskewNoopAngle,
+    RotationConfidenceThreshold,
+};
 
 /// Exit codes for the CLI
 ///
@@ -559,6 +562,22 @@ pub struct ConvertArgs {
     /// Override the geometry action for deskew correction
     #[arg(long, value_enum, requires = "geometry_only")]
     pub deskew_action: Option<GeometryAction>,
+
+    /// Maximum absolute angle eligible for automatic deskew
+    #[arg(long, requires = "geometry_only")]
+    pub deskew_max_angle: Option<DeskewMaxAngle>,
+
+    /// Minimum confidence required for automatic deskew
+    #[arg(long, requires = "geometry_only")]
+    pub deskew_min_confidence: Option<DeskewMinConfidence>,
+
+    /// Minimum detector feature count required for automatic deskew
+    #[arg(long, requires = "geometry_only")]
+    pub deskew_min_features: Option<DeskewMinFeatures>,
+
+    /// Absolute angle at or below which deskew is a no-op
+    #[arg(long, requires = "geometry_only")]
+    pub deskew_noop_angle: Option<DeskewNoopAngle>,
 
     // === Phase 6: Advanced processing options ===
     /// Enable internal resolution normalization (4960x7016)

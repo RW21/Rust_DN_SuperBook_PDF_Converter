@@ -170,11 +170,12 @@ pub use config::{
     MarkdownConfig, MarkdownValidationConfig, OcrConfig, OutputConfig, ProcessingConfig,
 };
 pub use deskew::{
-    DeskewAlgorithm, DeskewError, DeskewOptions, DeskewOptionsBuilder, DeskewResult,
-    ImageProcDeskewer, QualityMode, RotationAnalysisOptions, RotationAnalysisOptionsBuilder,
-    RotationConfidenceThreshold, RotationEvidence, RotationMetrics, RotationReason, SkewDetection,
-    DEFAULT_ROTATION_BORDER_CROP_FRACTION, DEFAULT_ROTATION_MAXIMUM_DENSE_ROW_FRACTION,
-    DEFAULT_ROTATION_MAXIMUM_ILLUSTRATION_INK_RATIO,
+    DeskewAlgorithm, DeskewError, DeskewMaxAngle, DeskewMinConfidence, DeskewMinFeatures,
+    DeskewNoopAngle, DeskewOptions, DeskewOptionsBuilder, DeskewPolicyOptions, DeskewReason,
+    DeskewResult, ImageProcDeskewer, QualityMode, RotationAnalysisOptions,
+    RotationAnalysisOptionsBuilder, RotationConfidenceThreshold, RotationEvidence, RotationMetrics,
+    RotationReason, SkewDetection, DEFAULT_ROTATION_BORDER_CROP_FRACTION,
+    DEFAULT_ROTATION_MAXIMUM_DENSE_ROW_FRACTION, DEFAULT_ROTATION_MAXIMUM_ILLUSTRATION_INK_RATIO,
     DEFAULT_ROTATION_MAXIMUM_LARGEST_COMPONENT_SHARE, DEFAULT_ROTATION_MINIMUM_APPLY_CONFIDENCE,
     DEFAULT_ROTATION_MINIMUM_APPLY_SCORE, DEFAULT_ROTATION_MINIMUM_CONTRAST,
     DEFAULT_ROTATION_MINIMUM_DIMENSION, DEFAULT_ROTATION_MINIMUM_GLYPH_COMPONENTS,
@@ -250,8 +251,10 @@ pub use parallel::{
     ParallelResult,
 };
 pub use pipeline::{
-    calculate_optimal_chunk_size, process_in_chunks, PdfPipeline, PipelineConfig, PipelineError,
-    PipelineResult, ProcessingContext, ProgressCallback, RotationPolicyOutcome, SilentProgress,
+    calculate_optimal_chunk_size, process_in_chunks, DeskewApplicationMetadata, DeskewCanvas,
+    DeskewInterpolation, DeskewPixelMode, DeskewPolicyOutcome, PdfPipeline, PipelineConfig,
+    PipelineError, PipelineResult, ProcessingContext, ProgressCallback, RotationPolicyOutcome,
+    SilentProgress,
 };
 pub use progress::{build_progress_bar, OutputMode, ProcessingStage, ProgressTracker};
 pub use vertical_detect::{

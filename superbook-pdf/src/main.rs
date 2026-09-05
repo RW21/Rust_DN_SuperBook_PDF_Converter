@@ -162,6 +162,7 @@ fn run_convert(args: &ConvertArgs, matches: &ArgMatches) -> Result<(), Box<dyn s
     // Merge config file with CLI arguments (CLI takes precedence)
     let pipeline_config = file_config.merge_with_cli(&cli_overrides);
     validate_geometry_only_cli_options(args, matches, &pipeline_config)?;
+    pipeline_config.deskew_policy()?;
     let pipeline = PdfPipeline::new(pipeline_config);
 
     if args.dry_run {
@@ -346,6 +347,18 @@ fn create_cli_overrides(args: &ConvertArgs, matches: &ArgMatches) -> CliOverride
     }
     if is_command_line(matches, "deskew_action") {
         overrides.deskew_action = args.deskew_action;
+    }
+    if is_command_line(matches, "deskew_max_angle") {
+        overrides.deskew_max_angle = args.deskew_max_angle;
+    }
+    if is_command_line(matches, "deskew_min_confidence") {
+        overrides.deskew_min_confidence = args.deskew_min_confidence;
+    }
+    if is_command_line(matches, "deskew_min_features") {
+        overrides.deskew_min_features = args.deskew_min_features;
+    }
+    if is_command_line(matches, "deskew_noop_angle") {
+        overrides.deskew_noop_angle = args.deskew_noop_angle;
     }
 
     // CLI defaults - only override if user explicitly changed these
@@ -558,6 +571,13 @@ fn print_execution_plan(
             config.rotation_min_confidence
         );
         println!("Deskew action: {}", config.deskew_action);
+        println!("Deskew maximum angle: {}", config.deskew_max_angle);
+        println!(
+            "Deskew minimum confidence: {}",
+            config.deskew_min_confidence
+        );
+        println!("Deskew minimum features: {}", config.deskew_min_features);
+        println!("Deskew no-op angle: {}", config.deskew_noop_angle);
         println!();
         println!("Pipeline Configuration:");
         println!("  1. Native Page Extraction");

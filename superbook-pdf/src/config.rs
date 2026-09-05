@@ -27,7 +27,10 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 use crate::cli::{GeometryAction, GeometryModeAction};
-use crate::{PipelineConfig, RotationConfidenceThreshold};
+use crate::{
+    DeskewMaxAngle, DeskewMinConfidence, DeskewMinFeatures, DeskewNoopAngle, PipelineConfig,
+    RotationConfidenceThreshold,
+};
 
 /// Configuration file errors
 #[derive(Debug, Error)]
@@ -87,6 +90,22 @@ pub struct ProcessingConfig {
     /// Override the common action for deskew correction
     #[serde(default)]
     pub deskew_action: Option<GeometryAction>,
+
+    /// Maximum absolute angle eligible for automatic deskew
+    #[serde(default)]
+    pub deskew_max_angle: Option<DeskewMaxAngle>,
+
+    /// Minimum confidence required for automatic deskew
+    #[serde(default)]
+    pub deskew_min_confidence: Option<DeskewMinConfidence>,
+
+    /// Minimum detector feature count required for automatic deskew
+    #[serde(default)]
+    pub deskew_min_features: Option<DeskewMinFeatures>,
+
+    /// Absolute angle at or below which deskew is a no-op
+    #[serde(default)]
+    pub deskew_noop_angle: Option<DeskewNoopAngle>,
 
     /// Margin trim percentage
     #[serde(default)]
@@ -408,6 +427,18 @@ impl Config {
         if let Some(threshold) = self.processing.rotation_min_confidence {
             config.rotation_min_confidence = threshold;
         }
+        if let Some(value) = self.processing.deskew_max_angle {
+            config.deskew_max_angle = value;
+        }
+        if let Some(value) = self.processing.deskew_min_confidence {
+            config.deskew_min_confidence = value;
+        }
+        if let Some(value) = self.processing.deskew_min_features {
+            config.deskew_min_features = value;
+        }
+        if let Some(value) = self.processing.deskew_noop_angle {
+            config.deskew_noop_angle = value;
+        }
 
         config.enforce_geometry_only_constraints();
 
@@ -507,6 +538,18 @@ impl Config {
         if let Some(threshold) = cli.rotation_min_confidence {
             config.rotation_min_confidence = threshold;
         }
+        if let Some(value) = cli.deskew_max_angle {
+            config.deskew_max_angle = value;
+        }
+        if let Some(value) = cli.deskew_min_confidence {
+            config.deskew_min_confidence = value;
+        }
+        if let Some(value) = cli.deskew_min_features {
+            config.deskew_min_features = value;
+        }
+        if let Some(value) = cli.deskew_noop_angle {
+            config.deskew_noop_angle = value;
+        }
 
         config.enforce_geometry_only_constraints();
 
@@ -533,6 +576,10 @@ pub struct CliOverrides {
     pub rotation_action: Option<GeometryAction>,
     pub rotation_min_confidence: Option<RotationConfidenceThreshold>,
     pub deskew_action: Option<GeometryAction>,
+    pub deskew_max_angle: Option<DeskewMaxAngle>,
+    pub deskew_min_confidence: Option<DeskewMinConfidence>,
+    pub deskew_min_features: Option<DeskewMinFeatures>,
+    pub deskew_noop_angle: Option<DeskewNoopAngle>,
     pub dpi: Option<u32>,
     pub deskew: Option<bool>,
     pub margin_trim: Option<f64>,
@@ -904,6 +951,74 @@ rotation_min_confidence = 0.95
         };
         let overridden = config.merge_with_cli(&cli);
         assert_eq!(overridden.rotation_min_confidence.get(), 0.97);
+    }
+
+    #[test]
+    fn deskew_policy_config_defaults_toml_and_cli_precedence_are_validated() {
+        let defaults = Config::default().to_pipeline_config();
+        assert_eq!(defaults.deskew_max_angle.get(), 5.0);
+        assert_eq!(defaults.deskew_min_confidence.get(), 0.90);
+        assert_eq!(defaults.deskew_min_features.get(), 100);
+        assert_eq!(defaults.deskew_noop_angle.get(), 0.10);
+        defaults.deskew_policy().unwrap();
+
+        let config = Config::from_toml(
+            r#"
+[processing]
+geometry_only = true
+deskew_max_angle = 4.0
+deskew_min_confidence = 0.95
+deskew_min_features = 150
+deskew_noop_angle = 0.2
+"#,
+        )
+        .unwrap();
+        let from_toml = config.to_pipeline_config();
+        assert_eq!(from_toml.deskew_max_angle.get(), 4.0);
+        assert_eq!(from_toml.deskew_min_confidence.get(), 0.95);
+        assert_eq!(from_toml.deskew_min_features.get(), 150);
+        assert_eq!(from_toml.deskew_noop_angle.get(), 0.2);
+        from_toml.deskew_policy().unwrap();
+
+        let omitted = config.merge_with_cli(&CliOverrides::default());
+        assert_eq!(omitted.deskew_max_angle.get(), 4.0);
+        assert_eq!(omitted.deskew_min_confidence.get(), 0.95);
+        assert_eq!(omitted.deskew_min_features.get(), 150);
+        assert_eq!(omitted.deskew_noop_angle.get(), 0.2);
+
+        let overrides = CliOverrides {
+            deskew_max_angle: Some(DeskewMaxAngle::new(5.0).unwrap()),
+            deskew_min_confidence: Some(DeskewMinConfidence::new(0.90).unwrap()),
+            deskew_min_features: Some(DeskewMinFeatures::new(100).unwrap()),
+            deskew_noop_angle: Some(DeskewNoopAngle::new(0.10).unwrap()),
+            ..CliOverrides::default()
+        };
+        let overridden = config.merge_with_cli(&overrides);
+        assert_eq!(overridden.deskew_max_angle.get(), 5.0);
+        assert_eq!(overridden.deskew_min_confidence.get(), 0.90);
+        assert_eq!(overridden.deskew_min_features.get(), 100);
+        assert_eq!(overridden.deskew_noop_angle.get(), 0.10);
+        overridden.deskew_policy().unwrap();
+    }
+
+    #[test]
+    fn deskew_policy_cross_field_validation_occurs_after_merge() {
+        let config = Config::from_toml(
+            r#"
+[processing]
+geometry_only = true
+deskew_max_angle = 0.5
+deskew_noop_angle = 0.5
+"#,
+        )
+        .unwrap();
+        assert!(config.to_pipeline_config().deskew_policy().is_err());
+
+        let repaired = config.merge_with_cli(&CliOverrides {
+            deskew_max_angle: Some(DeskewMaxAngle::new(1.0).unwrap()),
+            ..CliOverrides::default()
+        });
+        repaired.deskew_policy().unwrap();
     }
 
     #[test]

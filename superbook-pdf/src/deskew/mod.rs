@@ -35,10 +35,13 @@ mod types;
 // Re-export public API
 pub use algorithm::ImageProcDeskewer;
 pub use types::{
-    DeskewAlgorithm, DeskewError, DeskewOptions, DeskewOptionsBuilder, DeskewResult, Deskewer,
-    QualityMode, Result, RotationAnalysisOptions, RotationAnalysisOptionsBuilder,
-    RotationConfidenceThreshold, RotationEvidence, RotationMetrics, RotationReason, SkewDetection,
-    DEFAULT_BACKGROUND_COLOR, DEFAULT_MAX_ANGLE, DEFAULT_ROTATION_BORDER_CROP_FRACTION,
+    DeskewAlgorithm, DeskewError, DeskewMaxAngle, DeskewMinConfidence, DeskewMinFeatures,
+    DeskewNoopAngle, DeskewOptions, DeskewOptionsBuilder, DeskewPolicyOptions, DeskewReason,
+    DeskewResult, Deskewer, QualityMode, Result, RotationAnalysisOptions,
+    RotationAnalysisOptionsBuilder, RotationConfidenceThreshold, RotationEvidence, RotationMetrics,
+    RotationReason, SkewDetection, DEFAULT_BACKGROUND_COLOR, DEFAULT_DESKEW_MAX_ANGLE,
+    DEFAULT_DESKEW_MIN_CONFIDENCE, DEFAULT_DESKEW_MIN_FEATURES, DEFAULT_DESKEW_NOOP_ANGLE,
+    DEFAULT_MAX_ANGLE, DEFAULT_ROTATION_BORDER_CROP_FRACTION,
     DEFAULT_ROTATION_MAXIMUM_DENSE_ROW_FRACTION, DEFAULT_ROTATION_MAXIMUM_ILLUSTRATION_INK_RATIO,
     DEFAULT_ROTATION_MAXIMUM_LARGEST_COMPONENT_SHARE, DEFAULT_ROTATION_MINIMUM_APPLY_CONFIDENCE,
     DEFAULT_ROTATION_MINIMUM_APPLY_SCORE, DEFAULT_ROTATION_MINIMUM_CONTRAST,

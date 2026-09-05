@@ -29,9 +29,12 @@ use thiserror::Error;
 
 use crate::cli::{ConvertArgs, GeometryAction};
 use crate::deskew::{
-    RotationAnalysisOptions, RotationConfidenceThreshold, RotationEvidence, RotationReason,
+    DeskewAlgorithm, DeskewMaxAngle, DeskewMinConfidence, DeskewMinFeatures, DeskewNoopAngle,
+    DeskewOptions, DeskewPolicyOptions, DeskewReason, QualityMode, RotationAnalysisOptions,
+    RotationConfidenceThreshold, RotationEvidence, RotationReason, SkewDetection,
+    DEFAULT_MAX_ANGLE,
 };
-use crate::transform_manifest::{RotationTransform, TransformDecision};
+use crate::transform_manifest::{DeskewTransform, RotationTransform, TransformDecision};
 
 // ============================================================
 // Memory Management Utilities (Phase 3 optimization)
@@ -248,6 +251,18 @@ pub struct PipelineConfig {
     /// Action for deskew analysis/application
     #[serde(default = "default_geometry_action_apply")]
     pub deskew_action: GeometryAction,
+    /// Maximum absolute angle eligible for automatic deskew
+    #[serde(default)]
+    pub deskew_max_angle: DeskewMaxAngle,
+    /// Minimum confidence required for automatic deskew
+    #[serde(default)]
+    pub deskew_min_confidence: DeskewMinConfidence,
+    /// Minimum detector feature count required for automatic deskew
+    #[serde(default)]
+    pub deskew_min_features: DeskewMinFeatures,
+    /// Absolute angle at or below which deskew is a no-op
+    #[serde(default)]
+    pub deskew_noop_angle: DeskewNoopAngle,
     /// Whether the deskew action was explicitly resolved or configured
     #[doc(hidden)]
     #[serde(default, skip_serializing_if = "is_false")]
@@ -343,6 +358,10 @@ impl Default for PipelineConfig {
             rotation_min_confidence: RotationConfidenceThreshold::default(),
             rotation_action_configured: false,
             deskew_action: GeometryAction::Apply,
+            deskew_max_angle: DeskewMaxAngle::default(),
+            deskew_min_confidence: DeskewMinConfidence::default(),
+            deskew_min_features: DeskewMinFeatures::default(),
+            deskew_noop_angle: DeskewNoopAngle::default(),
             deskew_action_configured: false,
             dpi: 300,
             deskew: true,
@@ -371,6 +390,17 @@ impl Default for PipelineConfig {
 }
 
 impl PipelineConfig {
+    /// Return the cross-field validated conservative deskew policy.
+    pub fn deskew_policy(&self) -> Result<DeskewPolicyOptions, PipelineError> {
+        DeskewPolicyOptions::new(
+            self.deskew_max_angle,
+            self.deskew_min_confidence,
+            self.deskew_min_features,
+            self.deskew_noop_angle,
+        )
+        .map_err(|error| PipelineError::ImageProcessingFailed(error.to_string()))
+    }
+
     /// Create a safe geometry-only configuration with explicit actions.
     pub fn geometry_only(rotation_action: GeometryAction, deskew_action: GeometryAction) -> Self {
         let mut config = Self {
@@ -394,6 +424,10 @@ impl PipelineConfig {
             rotation_min_confidence: args.rotation_min_confidence.unwrap_or_default(),
             rotation_action_configured: true,
             deskew_action: args.effective_deskew_action(),
+            deskew_max_angle: args.deskew_max_angle.unwrap_or_default(),
+            deskew_min_confidence: args.deskew_min_confidence.unwrap_or_default(),
+            deskew_min_features: args.deskew_min_features.unwrap_or_default(),
+            deskew_noop_angle: args.deskew_noop_angle.unwrap_or_default(),
             deskew_action_configured: true,
             dpi: args.dpi,
             deskew: args.effective_deskew(),
@@ -603,6 +637,159 @@ impl RotationPolicyOutcome {
     }
 }
 
+/// Auditable policy result derived from one deskew analysis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeskewInterpolation {
+    Lanczos3,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeskewCanvas {
+    Expanded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeskewPixelMode {
+    Rgba8,
+}
+
+/// Exact decoded-raster behavior used by the current deskew implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeskewApplicationMetadata {
+    pub interpolation: DeskewInterpolation,
+    pub canvas: DeskewCanvas,
+    pub fill_rgba: [u8; 4],
+    pub output_pixel_mode: DeskewPixelMode,
+}
+
+impl DeskewApplicationMetadata {
+    pub const fn current() -> Self {
+        Self {
+            interpolation: DeskewInterpolation::Lanczos3,
+            canvas: DeskewCanvas::Expanded,
+            fill_rgba: [255, 255, 255, 255],
+            output_pixel_mode: DeskewPixelMode::Rgba8,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeskewPolicyOutcome {
+    pub page_index: usize,
+    pub detection: Option<SkewDetection>,
+    pub transform: DeskewTransform,
+    pub application: Option<DeskewApplicationMetadata>,
+    pub should_apply: bool,
+    pub review_required: bool,
+}
+
+impl DeskewPolicyOutcome {
+    fn without_detection(page_index: usize, reason: DeskewReason) -> Result<Self, PipelineError> {
+        Ok(Self {
+            page_index,
+            detection: None,
+            transform: DeskewTransform::new(
+                0.0,
+                0.0,
+                0,
+                TransformDecision::Unchanged,
+                reason.to_string(),
+            )?,
+            application: None,
+            should_apply: false,
+            review_required: false,
+        })
+    }
+
+    fn from_detection(
+        page_index: usize,
+        detection: &SkewDetection,
+        action: GeometryAction,
+        policy: DeskewPolicyOptions,
+    ) -> Result<Self, PipelineError> {
+        detection
+            .validate()
+            .map_err(|error| PipelineError::ImageProcessingFailed(error.to_string()))?;
+        let magnitude = detection.angle.abs();
+        let (decision, reason, should_apply, review_required) =
+            if magnitude > policy.maximum_angle().get() {
+                (
+                    TransformDecision::Rejected,
+                    DeskewReason::AngleOutsideLimit,
+                    false,
+                    true,
+                )
+            } else if detection.confidence < policy.minimum_confidence().get() {
+                (
+                    TransformDecision::Rejected,
+                    DeskewReason::InsufficientConfidence,
+                    false,
+                    true,
+                )
+            } else if detection.feature_count < policy.minimum_features().get() {
+                (
+                    TransformDecision::Rejected,
+                    DeskewReason::InsufficientFeatures,
+                    false,
+                    true,
+                )
+            } else if magnitude <= policy.noop_angle().get() {
+                (
+                    TransformDecision::Unchanged,
+                    DeskewReason::WithinNoopThreshold,
+                    false,
+                    false,
+                )
+            } else {
+                match action {
+                    GeometryAction::Report => (
+                        TransformDecision::Proposed,
+                        DeskewReason::CorrectionEvidence,
+                        false,
+                        true,
+                    ),
+                    GeometryAction::Apply => (
+                        TransformDecision::Proposed,
+                        DeskewReason::CorrectionEvidence,
+                        true,
+                        false,
+                    ),
+                    GeometryAction::Off => (
+                        TransformDecision::Unchanged,
+                        DeskewReason::Disabled,
+                        false,
+                        false,
+                    ),
+                }
+            };
+
+        Ok(Self {
+            page_index,
+            detection: Some(detection.clone()),
+            transform: DeskewTransform::new(
+                detection.angle,
+                detection.confidence,
+                detection.feature_count,
+                decision,
+                reason.to_string(),
+            )?,
+            application: None,
+            should_apply,
+            review_required,
+        })
+    }
+
+    fn mark_applied(&mut self) {
+        debug_assert!(self.should_apply);
+        self.transform.decision = TransformDecision::Applied;
+        self.application = Some(DeskewApplicationMetadata::current());
+    }
+}
+
 impl PipelineResult {
     /// Create a new pipeline result
     pub fn new(
@@ -696,6 +883,88 @@ impl PdfPipeline {
             self.config.rotation_min_confidence,
         )
         .map(Some)
+    }
+
+    /// Analyze one page exactly once and map its evidence through deskew policy.
+    pub fn analyze_deskew(
+        &self,
+        page_index: usize,
+        image_path: &Path,
+        blank: bool,
+    ) -> Result<DeskewPolicyOutcome, PipelineError> {
+        if self.config.deskew_action == GeometryAction::Off {
+            return DeskewPolicyOutcome::without_detection(page_index, DeskewReason::Disabled);
+        }
+        if blank {
+            return DeskewPolicyOutcome::without_detection(page_index, DeskewReason::BlankPage);
+        }
+
+        let policy = self.config.deskew_policy()?;
+        let analysis_options = DeskewOptions::builder()
+            .algorithm(DeskewAlgorithm::PageEdge)
+            .max_angle(DEFAULT_MAX_ANGLE)
+            .threshold_angle(0.0)
+            .build();
+        let detection = crate::ImageProcDeskewer::detect_skew(image_path, &analysis_options)
+            .map_err(|error| PipelineError::ImageProcessingFailed(error.to_string()))?;
+        DeskewPolicyOutcome::from_detection(
+            page_index,
+            &detection,
+            self.config.deskew_action,
+            policy,
+        )
+    }
+
+    /// Apply one previously analyzed, policy-approved deskew proposal.
+    ///
+    /// The outcome is re-derived from its evidence and the current pipeline
+    /// policy before pixels change. Detection is never rerun.
+    pub fn apply_deskew_outcome(
+        &self,
+        page_index: usize,
+        input_path: &Path,
+        output_path: &Path,
+        mut outcome: DeskewPolicyOutcome,
+    ) -> Result<DeskewPolicyOutcome, PipelineError> {
+        let detection = outcome.detection.clone().ok_or_else(|| {
+            PipelineError::ImageProcessingFailed(
+                "deskew application requires measured evidence".to_string(),
+            )
+        })?;
+        let expected = DeskewPolicyOutcome::from_detection(
+            page_index,
+            &detection,
+            self.config.deskew_action,
+            self.config.deskew_policy()?,
+        )?;
+        if outcome != expected || !outcome.should_apply {
+            return Err(PipelineError::ImageProcessingFailed(
+                "deskew outcome is not an untampered approved proposal".to_string(),
+            ));
+        }
+
+        let policy = self.config.deskew_policy()?;
+        let options = DeskewOptions::builder()
+            .algorithm(DeskewAlgorithm::PageEdge)
+            .max_angle(policy.maximum_angle().get())
+            .threshold_angle(policy.noop_angle().get())
+            .background_color([255, 255, 255])
+            .quality_mode(QualityMode::HighQuality)
+            .build();
+        let result = crate::ImageProcDeskewer::correct_skew_with_detection(
+            input_path,
+            output_path,
+            &detection,
+            &options,
+        )
+        .map_err(|error| PipelineError::ImageProcessingFailed(error.to_string()))?;
+        if !result.corrected {
+            return Err(PipelineError::ImageProcessingFailed(
+                "approved deskew did not publish a transformed output".to_string(),
+            ));
+        }
+        outcome.mark_applied();
+        Ok(outcome)
     }
 
     /// Reject pipeline modes whose safe writer path is not implemented yet.
@@ -934,12 +1203,6 @@ impl PdfPipeline {
     /// Minimum non-background pixel ratio to consider a page as having content
     const BLANK_PAGE_THRESHOLD: f64 = 0.02; // 2% (was 1%, increased to catch near-blank pages)
 
-    /// Minimum feature count for reliable deskew detection
-    const MIN_DESKEW_FEATURES: usize = 10;
-
-    /// Minimum confidence for deskew correction
-    const MIN_DESKEW_CONFIDENCE: f64 = 0.1;
-
     /// Detect blank pages (< 1% non-background pixels)
     ///
     /// Returns a boolean vec where `true` means the page is blank.
@@ -1045,7 +1308,7 @@ impl PdfPipeline {
         Ok(results.into_iter().map(|(path, _)| path).collect())
     }
 
-    /// Step 3: Deskew correction (with blank page skip + confidence filter)
+    /// Step 5: conservative deskew analysis and policy application.
     fn step_deskew<P: ProgressCallback>(
         &self,
         work_dir: &Path,
@@ -1053,89 +1316,64 @@ impl PdfPipeline {
         blank_pages: &[bool],
         progress: &P,
     ) -> Result<Vec<PathBuf>, PipelineError> {
-        progress.on_step_start("Applying deskew correction...");
+        progress.on_step_start("Analyzing page skew...");
+        if blank_pages.len() != images.len() {
+            return Err(PipelineError::ImageProcessingFailed(format!(
+                "deskew blank-page cardinality mismatch: {} images, {} flags",
+                images.len(),
+                blank_pages.len()
+            )));
+        }
         let deskewed_dir = work_dir.join("deskewed");
         std::fs::create_dir_all(&deskewed_dir)?;
-
-        // Use PageEdge algorithm for scanned book pages (detects page boundary skew)
-        let deskew_options = crate::DeskewOptions::builder()
-            .algorithm(crate::DeskewAlgorithm::PageEdge)
-            .build();
+        self.config.deskew_policy()?;
         let output_paths: Vec<PathBuf> = images
             .iter()
             .enumerate()
-            .map(|(idx, img)| {
-                let name = img
-                    .file_name()
-                    .map(|n| n.to_os_string())
-                    .unwrap_or_else(|| std::ffi::OsString::from(format!("page_{:04}.png", idx)));
+            .map(|(index, image)| {
+                let name = image.file_name().map_or_else(
+                    || std::ffi::OsString::from(format!("page_{index:04}.png")),
+                    std::ffi::OsStr::to_os_string,
+                );
                 deskewed_dir.join(name)
             })
             .collect();
 
-        let skipped = AtomicUsize::new(0);
-        let low_confidence = AtomicUsize::new(0);
-        let reported = AtomicUsize::new(0);
-
-        let results: Vec<PathBuf> = images
+        let results: Result<Vec<(PathBuf, DeskewPolicyOutcome)>, PipelineError> = images
             .par_iter()
             .zip(output_paths.par_iter())
+            .zip(blank_pages.par_iter())
             .enumerate()
-            .map(|(idx, (img_path, output_path))| {
-                // Skip blank pages
-                if blank_pages.get(idx).copied().unwrap_or(false) {
-                    std::fs::copy(img_path, output_path).ok();
-                    skipped.fetch_add(1, Ordering::Relaxed);
-                    return output_path.clone();
+            .map(|(page_index, ((input_path, output_path), blank))| {
+                let mut outcome = self.analyze_deskew(page_index, input_path, *blank)?;
+                if outcome.should_apply {
+                    outcome =
+                        self.apply_deskew_outcome(page_index, input_path, output_path, outcome)?;
+                } else {
+                    std::fs::copy(input_path, output_path)?;
                 }
-
-                // Detect skew first, then apply confidence filter
-                match crate::ImageProcDeskewer::detect_skew(img_path, &deskew_options) {
-                    Ok(detection) => {
-                        if detection.feature_count < Self::MIN_DESKEW_FEATURES
-                            || detection.confidence < Self::MIN_DESKEW_CONFIDENCE
-                        {
-                            // Low confidence: skip correction
-                            std::fs::copy(img_path, output_path).ok();
-                            low_confidence.fetch_add(1, Ordering::Relaxed);
-                        } else if self.config.deskew_action == GeometryAction::Report {
-                            // Report mode must never alter decoded pixels.
-                            std::fs::copy(img_path, output_path).ok();
-                            reported.fetch_add(1, Ordering::Relaxed);
-                        } else {
-                            // Apply mode only.
-                            match crate::ImageProcDeskewer::correct_skew(
-                                img_path,
-                                output_path,
-                                &deskew_options,
-                            ) {
-                                Ok(_) => {}
-                                Err(_) => {
-                                    std::fs::copy(img_path, output_path).ok();
-                                }
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        std::fs::copy(img_path, output_path).ok();
-                    }
-                }
-                output_path.clone()
+                Ok((output_path.clone(), outcome))
             })
             .collect();
 
-        let skipped_count = skipped.load(Ordering::Relaxed);
-        let low_conf_count = low_confidence.load(Ordering::Relaxed);
-        let reported_count = reported.load(Ordering::Relaxed);
-        let corrected = results.len() - skipped_count - low_conf_count - reported_count;
+        let results = results?;
+        let applied = results
+            .iter()
+            .filter(|(_, outcome)| outcome.transform.decision == TransformDecision::Applied)
+            .count();
+        let proposed = results
+            .iter()
+            .filter(|(_, outcome)| outcome.transform.decision == TransformDecision::Proposed)
+            .count();
+        let review_required = results
+            .iter()
+            .filter(|(_, outcome)| outcome.review_required)
+            .count();
         progress.on_step_complete(
             "Deskew",
-            &format!(
-                "{} corrected, {} reported, {} skipped (blank), {} skipped (low confidence)",
-                corrected, reported_count, skipped_count, low_conf_count
-            ),
+            &format!("{applied} corrected, {proposed} proposed, {review_required} require review"),
         );
-        Ok(results)
+        Ok(results.into_iter().map(|(path, _)| path).collect())
     }
 
     /// Step 2.5: Shadow removal (after margin trim, before upscale)
@@ -2078,6 +2316,358 @@ mod tests {
             rotation_min_confidence: RotationConfidenceThreshold::default(),
             ..PipelineConfig::default()
         })
+    }
+
+    fn deskew_policy() -> DeskewPolicyOptions {
+        DeskewPolicyOptions::default()
+    }
+
+    fn deskew_detection(angle: f64, confidence: f64, features: usize) -> SkewDetection {
+        SkewDetection::try_new(angle, confidence, features).unwrap()
+    }
+
+    fn synthetic_page_edge(angle_degrees: f64) -> DynamicImage {
+        let width = 320_u32;
+        let height = 480_u32;
+        let slope = angle_degrees.to_radians().tan();
+        let mut image = GrayImage::from_pixel(width, height, Luma([255]));
+        for y in 0..height {
+            let edge = (25.0 + slope * f64::from(y)).round().clamp(6.0, 60.0) as u32;
+            for x in edge..width {
+                image.put_pixel(x, y, Luma([32]));
+            }
+        }
+        DynamicImage::ImageLuma8(image)
+    }
+
+    fn write_one_bit_pbm(path: &Path) {
+        let width = 64;
+        let height = 96;
+        let bytes_per_row = width / 8;
+        let mut packed = vec![0x00_u8; (bytes_per_row * height) as usize];
+        for y in 8..88 {
+            if (y / 6) % 2 == 0 {
+                packed[(y * bytes_per_row + 2) as usize] = 0xff;
+            }
+        }
+        let mut encoded = format!("P4\n{width} {height}\n").into_bytes();
+        encoded.extend_from_slice(&packed);
+        std::fs::write(path, encoded).expect("encode one-bit PBM");
+    }
+
+    #[test]
+    fn deskew_policy_maps_boundaries_and_review_states() {
+        let policy = deskew_policy();
+        let cases = [
+            (
+                deskew_detection(0.10, 0.90, 100),
+                GeometryAction::Apply,
+                TransformDecision::Unchanged,
+                DeskewReason::WithinNoopThreshold,
+                false,
+                false,
+            ),
+            (
+                deskew_detection(5.0, 0.90, 100),
+                GeometryAction::Apply,
+                TransformDecision::Proposed,
+                DeskewReason::CorrectionEvidence,
+                true,
+                false,
+            ),
+            (
+                deskew_detection(5.001, 1.0, 1000),
+                GeometryAction::Apply,
+                TransformDecision::Rejected,
+                DeskewReason::AngleOutsideLimit,
+                false,
+                true,
+            ),
+            (
+                deskew_detection(0.05, 0.89, 1000),
+                GeometryAction::Apply,
+                TransformDecision::Rejected,
+                DeskewReason::InsufficientConfidence,
+                false,
+                true,
+            ),
+            (
+                deskew_detection(1.0, 1.0, 99),
+                GeometryAction::Apply,
+                TransformDecision::Rejected,
+                DeskewReason::InsufficientFeatures,
+                false,
+                true,
+            ),
+            (
+                deskew_detection(-2.0, 0.95, 150),
+                GeometryAction::Report,
+                TransformDecision::Proposed,
+                DeskewReason::CorrectionEvidence,
+                false,
+                true,
+            ),
+        ];
+
+        for (detection, action, decision, reason, should_apply, review_required) in cases {
+            let outcome =
+                DeskewPolicyOutcome::from_detection(9, &detection, action, policy).unwrap();
+            assert_eq!(outcome.page_index, 9);
+            assert_eq!(outcome.detection.as_ref(), Some(&detection));
+            assert_eq!(outcome.transform.decision, decision);
+            assert_eq!(outcome.transform.reason, reason.as_str());
+            assert_eq!(outcome.should_apply, should_apply);
+            assert_eq!(outcome.review_required, review_required);
+            assert_eq!(outcome.transform.proposed_degrees.get(), detection.angle);
+            assert!(outcome.application.is_none());
+        }
+    }
+
+    #[test]
+    fn deskew_outcome_becomes_applied_only_with_publication_metadata() {
+        let mut outcome = DeskewPolicyOutcome::from_detection(
+            9,
+            &deskew_detection(-1.25, 0.97, 420),
+            GeometryAction::Apply,
+            deskew_policy(),
+        )
+        .unwrap();
+        assert_eq!(outcome.page_index, 9);
+        assert_eq!(outcome.detection.as_ref().unwrap().angle, -1.25);
+        assert_eq!(outcome.transform.proposed_degrees.get(), -1.25);
+        assert_eq!(outcome.transform.decision, TransformDecision::Proposed);
+        assert!(outcome.application.is_none());
+
+        outcome.mark_applied();
+        assert_eq!(outcome.transform.decision, TransformDecision::Applied);
+        assert_eq!(
+            outcome.application,
+            Some(DeskewApplicationMetadata::current())
+        );
+        let encoded = serde_json::to_string(&outcome.application.unwrap()).unwrap();
+        assert!(encoded.contains("\"interpolation\":\"lanczos3\""));
+        assert!(encoded.contains("\"output_pixel_mode\":\"rgba8\""));
+        assert!(serde_json::from_str::<DeskewApplicationMetadata>(
+            r#"{"interpolation":"lanczos3","canvas":"expanded","fill_rgba":[255,255,255,255],"output_pixel_mode":"rgba8","extra":true}"#,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn public_deskew_apply_consumes_only_an_untampered_proposal() {
+        let temp = tempdir().unwrap();
+        let input = temp.path().join("page.png");
+        let output = temp.path().join("applied.png");
+        synthetic_page_edge(2.0).save(&input).unwrap();
+        let pipeline = PdfPipeline::new(PipelineConfig {
+            deskew_action: GeometryAction::Apply,
+            deskew_action_configured: true,
+            ..PipelineConfig::default()
+        });
+
+        let proposal = pipeline.analyze_deskew(12, &input, false).unwrap();
+        let applied = pipeline
+            .apply_deskew_outcome(12, &input, &output, proposal)
+            .unwrap();
+        assert_eq!(applied.page_index, 12);
+        assert_eq!(applied.transform.decision, TransformDecision::Applied);
+        assert_eq!(
+            applied.application,
+            Some(DeskewApplicationMetadata::current())
+        );
+
+        let mut tampered = pipeline.analyze_deskew(13, &input, false).unwrap();
+        tampered.transform.reason = "tampered".to_string();
+        let rejected_output = temp.path().join("rejected.png");
+        assert!(pipeline
+            .apply_deskew_outcome(13, &input, &rejected_output, tampered)
+            .is_err());
+        assert!(!rejected_output.exists());
+
+        let mut wrong_page = pipeline.analyze_deskew(14, &input, false).unwrap();
+        wrong_page.page_index = 99;
+        let wrong_page_output = temp.path().join("wrong-page.png");
+        assert!(pipeline
+            .apply_deskew_outcome(14, &input, &wrong_page_output, wrong_page)
+            .is_err());
+        assert!(!wrong_page_output.exists());
+    }
+
+    #[test]
+    fn deskew_disabled_and_blank_pages_do_not_read_images() {
+        let missing = Path::new("/path/that/does/not/exist.png");
+        let disabled = PdfPipeline::new(PipelineConfig {
+            deskew_action: GeometryAction::Off,
+            deskew_action_configured: true,
+            ..PipelineConfig::default()
+        })
+        .analyze_deskew(3, missing, false)
+        .unwrap();
+        assert_eq!(disabled.transform.reason, DeskewReason::Disabled.as_str());
+        assert!(disabled.detection.is_none());
+
+        let blank = PdfPipeline::new(PipelineConfig {
+            deskew_action: GeometryAction::Report,
+            deskew_action_configured: true,
+            ..PipelineConfig::default()
+        })
+        .analyze_deskew(4, missing, true)
+        .unwrap();
+        assert_eq!(blank.transform.reason, DeskewReason::BlankPage.as_str());
+        assert!(blank.detection.is_none());
+    }
+
+    #[test]
+    fn deskew_report_stage_preserves_bytes_and_input_order() {
+        let temp = tempdir().unwrap();
+        let first = temp.path().join("z-page.png");
+        let second = temp.path().join("a-page.png");
+        synthetic_page_edge(2.0).save(&first).unwrap();
+        synthetic_page_edge(-2.0).save(&second).unwrap();
+        let source_bytes = [
+            std::fs::read(&first).unwrap(),
+            std::fs::read(&second).unwrap(),
+        ];
+        let pipeline = PdfPipeline::new(PipelineConfig {
+            deskew_action: GeometryAction::Report,
+            deskew_action_configured: true,
+            ..PipelineConfig::default()
+        });
+        let outputs = pipeline
+            .step_deskew(
+                temp.path(),
+                &[first.clone(), second.clone()],
+                &[false, false],
+                &SilentProgress,
+            )
+            .unwrap();
+        assert_eq!(outputs[0].file_name(), first.file_name());
+        assert_eq!(outputs[1].file_name(), second.file_name());
+        assert_eq!(std::fs::read(&outputs[0]).unwrap(), source_bytes[0]);
+        assert_eq!(std::fs::read(&outputs[1]).unwrap(), source_bytes[1]);
+    }
+
+    #[test]
+    fn deskew_report_preserves_bilevel_and_vertical_layout_pages() {
+        let temp = tempdir().unwrap();
+        let bilevel = temp.path().join("bilevel.pbm");
+        write_one_bit_pbm(&bilevel);
+        let mut vertical_image = GrayImage::from_pixel(600, 800, Luma([255]));
+        for column in 0..8 {
+            let x0 = 80 + column * 60;
+            for y in (50..750).step_by(18) {
+                for yy in y..(y + 9) {
+                    for xx in x0..(x0 + 7) {
+                        vertical_image.put_pixel(xx, yy, Luma([0]));
+                    }
+                }
+            }
+        }
+        let vertical = temp.path().join("vertical.png");
+        vertical_image.save(&vertical).unwrap();
+        let source_bytes = [
+            std::fs::read(&bilevel).unwrap(),
+            std::fs::read(&vertical).unwrap(),
+        ];
+        assert!(
+            source_bytes[0].starts_with(b"P4\n"),
+            "fixture must be binary PBM"
+        );
+
+        let pipeline = PdfPipeline::new(PipelineConfig {
+            deskew_action: GeometryAction::Report,
+            deskew_action_configured: true,
+            ..PipelineConfig::default()
+        });
+        let outputs = pipeline
+            .step_deskew(
+                temp.path(),
+                &[bilevel, vertical],
+                &[false, false],
+                &SilentProgress,
+            )
+            .unwrap();
+        assert_eq!(std::fs::read(&outputs[0]).unwrap(), source_bytes[0]);
+        assert_eq!(std::fs::read(&outputs[1]).unwrap(), source_bytes[1]);
+    }
+
+    #[test]
+    fn deskew_apply_stage_uses_measured_evidence_and_publishes_rgba8() {
+        for (index, angle) in [-2.0_f64, 2.0].into_iter().enumerate() {
+            let temp = tempdir().unwrap();
+            let input = temp.path().join("page.png");
+            synthetic_page_edge(angle).save(&input).unwrap();
+            let pipeline = PdfPipeline::new(PipelineConfig {
+                deskew_action: GeometryAction::Apply,
+                deskew_action_configured: true,
+                ..PipelineConfig::default()
+            });
+            let proposal = pipeline.analyze_deskew(index, &input, false).unwrap();
+            assert!(proposal.should_apply);
+            assert!((proposal.detection.as_ref().unwrap().angle - angle).abs() < 0.25);
+            assert_eq!(proposal.transform.decision, TransformDecision::Proposed);
+            let outputs = pipeline
+                .step_deskew(temp.path(), &[input], &[false], &SilentProgress)
+                .unwrap();
+            let output = image::open(&outputs[0]).unwrap();
+            assert_eq!(output.color(), image::ColorType::Rgba8);
+            assert!(output.width() > 320);
+            assert!(output.height() > 480);
+            let corrected = pipeline.analyze_deskew(index, &outputs[0], false).unwrap();
+            let corrected_angle = corrected.detection.as_ref().unwrap().angle.abs();
+            assert!(
+                corrected_angle < angle.abs(),
+                "deskew must reduce the measured angle: input={angle}, output={corrected_angle}"
+            );
+        }
+    }
+
+    #[test]
+    fn deskew_stage_propagates_cardinality_analysis_copy_and_transform_errors() {
+        let temp = tempdir().unwrap();
+        let input = temp.path().join("page.png");
+        synthetic_page_edge(2.0).save(&input).unwrap();
+        let report = PdfPipeline::new(PipelineConfig {
+            deskew_action: GeometryAction::Report,
+            deskew_action_configured: true,
+            ..PipelineConfig::default()
+        });
+        assert!(report
+            .step_deskew(
+                temp.path(),
+                std::slice::from_ref(&input),
+                &[],
+                &SilentProgress
+            )
+            .is_err());
+
+        let invalid_temp = tempdir().unwrap();
+        let invalid = invalid_temp.path().join("invalid.png");
+        std::fs::write(&invalid, b"not an image").unwrap();
+        assert!(report
+            .step_deskew(invalid_temp.path(), &[invalid], &[false], &SilentProgress)
+            .is_err());
+
+        let copy_temp = tempdir().unwrap();
+        let copy_input = copy_temp.path().join("page.png");
+        synthetic_page_edge(2.0).save(&copy_input).unwrap();
+        std::fs::create_dir_all(copy_temp.path().join("deskewed/page.png")).unwrap();
+        assert!(report
+            .step_deskew(copy_temp.path(), &[copy_input], &[false], &SilentProgress)
+            .is_err());
+
+        let apply_temp = tempdir().unwrap();
+        let apply_input = apply_temp.path().join("page.png");
+        synthetic_page_edge(2.0).save(&apply_input).unwrap();
+        std::fs::create_dir_all(apply_temp.path().join("deskewed/page.png")).unwrap();
+        let apply = PdfPipeline::new(PipelineConfig {
+            deskew_action: GeometryAction::Apply,
+            deskew_action_configured: true,
+            ..PipelineConfig::default()
+        });
+        assert!(apply
+            .step_deskew(apply_temp.path(), &[apply_input], &[false], &SilentProgress)
+            .is_err());
     }
 
     #[test]

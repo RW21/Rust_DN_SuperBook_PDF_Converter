@@ -29,6 +29,10 @@ fn test_geometry_only_dry_run_defaults_to_report_actions() {
         .stdout(predicate::str::contains("Geometry-only mode: ENABLED"))
         .stdout(predicate::str::contains("Rotation action: report"))
         .stdout(predicate::str::contains("Deskew action: report"))
+        .stdout(predicate::str::contains("Deskew maximum angle: 5"))
+        .stdout(predicate::str::contains("Deskew minimum confidence: 0.9"))
+        .stdout(predicate::str::contains("Deskew minimum features: 100"))
+        .stdout(predicate::str::contains("Deskew no-op angle: 0.1"))
         .stdout(predicate::str::contains("Native Page Extraction"))
         .stdout(predicate::str::contains("Rotation Analysis"))
         .stdout(predicate::str::contains("Deskew Analysis"))
@@ -116,6 +120,95 @@ fn test_common_geometry_action_rejects_off() {
         .stderr(predicate::str::contains("possible values"))
         .stderr(predicate::str::contains("report"))
         .stderr(predicate::str::contains("apply"));
+}
+
+#[test]
+fn test_deskew_policy_options_require_geometry_only_and_validate_types() {
+    for (option, value) in [
+        ("--deskew-max-angle", "0"),
+        ("--deskew-max-angle", "15.1"),
+        ("--deskew-min-confidence", "1.1"),
+        ("--deskew-min-features", "0"),
+        ("--deskew-noop-angle", "15.1"),
+    ] {
+        superbook_cmd()
+            .args([
+                "convert",
+                "tests/fixtures/sample.pdf",
+                "--geometry-only",
+                option,
+                value,
+                "--dry-run",
+            ])
+            .assert()
+            .failure();
+    }
+
+    superbook_cmd()
+        .args([
+            "convert",
+            "tests/fixtures/sample.pdf",
+            "--deskew-max-angle",
+            "5",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--geometry-only"));
+}
+
+#[test]
+fn test_deskew_policy_cli_overrides_toml_even_at_nominal_defaults() {
+    let temp_dir = TempDir::new().unwrap();
+    let config_path = temp_dir.path().join("geometry.toml");
+    std::fs::write(
+        &config_path,
+        "[processing]\ngeometry_only = true\ndeskew_max_angle = 4.0\ndeskew_min_confidence = 0.95\ndeskew_min_features = 150\ndeskew_noop_angle = 0.2\n",
+    )
+    .unwrap();
+
+    superbook_cmd()
+        .args([
+            "convert",
+            "tests/fixtures/sample.pdf",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--geometry-only",
+            "--deskew-max-angle",
+            "5",
+            "--deskew-min-confidence",
+            "0.9",
+            "--deskew-min-features",
+            "100",
+            "--deskew-noop-angle",
+            "0.1",
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Deskew maximum angle: 5"))
+        .stdout(predicate::str::contains("Deskew minimum confidence: 0.9"))
+        .stdout(predicate::str::contains("Deskew minimum features: 100"))
+        .stdout(predicate::str::contains("Deskew no-op angle: 0.1"));
+}
+
+#[test]
+fn test_deskew_policy_rejects_cross_field_invalid_effective_config() {
+    superbook_cmd()
+        .args([
+            "convert",
+            "tests/fixtures/sample.pdf",
+            "--geometry-only",
+            "--deskew-max-angle",
+            "0.5",
+            "--deskew-noop-angle",
+            "0.5",
+            "--dry-run",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "deskew no-op angle must be smaller than the maximum angle",
+        ));
 }
 
 #[test]

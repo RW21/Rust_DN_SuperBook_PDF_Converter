@@ -240,6 +240,63 @@ physical-page manifest; Task 3 provides deterministic indexed outcomes and stric
   `review_required = true`.
 - Indexed outcomes retain the coordinator's physical page index.
 
+## Task 4: Conservative Deskew Policy
+
+Deskew analysis and application are separate operations. The coordinator assigns a
+zero-based physical page index and analyzes each nonblank page exactly once. `off`
+performs no image read. Blank pages are `unchanged` without analysis. Report mode
+copies the encoded source bytes and emits a manifest-ready outcome; apply mode uses
+the already measured angle rather than running detection again.
+Page-edge detection and application use the same clockwise-positive image-coordinate
+convention; the recorded proposed angle is therefore the angle passed to the raster
+transform, not its negation.
+
+The policy has four explicit CLI/TOML/library settings:
+
+- maximum correction angle: default `5.0` degrees, finite and in `0.0..=15.0` with
+  zero rejected;
+- minimum confidence: default `0.90`, finite and in `0.0..=1.0`;
+- minimum feature count: default `100`, with zero rejected;
+- no-op angle: default `0.10` degrees, finite and in `0.0..=15.0`, and strictly
+  smaller than the maximum correction angle.
+
+An automatic correction requires an absolute measured angle no greater than the
+configured maximum, confidence at least the configured minimum, feature count at least
+the configured minimum, and an absolute angle greater than the no-op threshold. The
+policy evaluates excessive angle, confidence, and feature support before classifying a
+well-supported tiny angle as `unchanged`; low-quality evidence therefore cannot hide
+behind the no-op threshold. Evidence outside any safety threshold is `rejected`, remains
+byte-identical, and requires review. Approved report evidence is `proposed` and requires
+review. Approved apply evidence remains `proposed` until a successful output write
+changes it to `applied`. Analysis, copy, and transform failures propagate as typed
+pipeline failures.
+
+The current decoded-pixel correction is retained in the manifest-ready policy outcome as
+Lanczos-3 interpolation, expanded canvas, opaque white RGBA fill, and RGBA8 output.
+These properties are not represented as preservation of the source pixel mode. The
+strict transform-manifest schema remains version 1; serializing this application object
+is deliberately deferred to the preservation coordinator, where it requires either a
+version-2 schema with dual-version reading or proof that version 1 was never externally
+published. Unchanged, rejected, and report-only pages have no application metadata.
+Geometry-only execution remains fail-closed until the native-raster writer and complete
+manifest coordinator are available. The numerical defaults are provisional conservative
+settings and must be reviewed against representative report data before production
+application is enabled.
+
+### Task 4 test cases
+
+- CLI, TOML, Serde, and direct-library policy values reject non-finite,
+  out-of-range, zero-count, and cross-field-invalid settings.
+- Positive and negative synthetic skew evidence retains finite angle, confidence,
+  and feature count; blank evidence remains unchanged.
+- Off, report, approved apply, no-op, excessive-angle, weak-confidence, and
+  weak-feature outcomes map to the required decisions and review flags.
+- Report, no-op, rejected, blank, and vertical/bilevel synthetic pages preserve
+  encoded bytes and input order.
+- Apply uses the supplied detection once, records its lossy decoded-pixel properties,
+  and becomes `applied` only after the output write succeeds.
+- Analysis, copy, and transform publication errors fail closed.
+
 ### Transform manifest test cases
 
 - Serde round-trip preserves every schema field and snake-case decisions.

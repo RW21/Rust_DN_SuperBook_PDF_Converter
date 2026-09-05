@@ -14,7 +14,7 @@ use super::types::{
     RotationAnalysisOptions, RotationEvidence, RotationMetrics, RotationReason, SkewDetection,
     ALPHA_OPAQUE, DEFAULT_ROTATION_MINIMUM_APPLY_SCORE, GRAYSCALE_THRESHOLD, WHITE_PIXEL,
 };
-use image::{DynamicImage, GenericImageView, GrayImage, Rgba};
+use image::{DynamicImage, GenericImageView, GrayImage, ImageFormat, Rgba};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 
@@ -503,24 +503,60 @@ impl ImageProcDeskewer {
         variance
     }
 
-    /// Correct skew in image
+    /// Correct skew in image.
     pub fn correct_skew(
         input_path: &Path,
         output_path: &Path,
         options: &DeskewOptions,
     ) -> Result<DeskewResult> {
         let detection = Self::detect_skew(input_path, options)?;
+        Self::correct_skew_with_detection(input_path, output_path, &detection, options)
+    }
+
+    /// Correct skew using a caller-supplied, previously measured detection.
+    ///
+    /// This keeps policy analysis and pixel application separate and prevents
+    /// a second detector run from changing the audited proposal.
+    pub fn correct_skew_with_detection(
+        input_path: &Path,
+        output_path: &Path,
+        detection: &SkewDetection,
+        options: &DeskewOptions,
+    ) -> Result<DeskewResult> {
+        if Self::paths_resolve_same(input_path, output_path)? {
+            return Err(DeskewError::CorrectionFailed(
+                "deskew output must differ from the source path".to_string(),
+            ));
+        }
+        detection.validate()?;
+        if !options.max_angle.is_finite() || options.max_angle <= 0.0 {
+            return Err(DeskewError::CorrectionFailed(
+                "deskew maximum angle must be finite and greater than zero".to_string(),
+            ));
+        }
+        if !options.threshold_angle.is_finite()
+            || options.threshold_angle < 0.0
+            || options.threshold_angle >= options.max_angle
+        {
+            return Err(DeskewError::CorrectionFailed(
+                "deskew threshold angle must be finite, nonnegative, and below the maximum angle"
+                    .to_string(),
+            ));
+        }
+        if detection.angle.abs() > options.max_angle {
+            return Err(DeskewError::CorrectionFailed(format!(
+                "measured deskew angle {} exceeds maximum {}",
+                detection.angle, options.max_angle
+            )));
+        }
 
         let img = image::open(input_path).map_err(|e| DeskewError::InvalidFormat(e.to_string()))?;
         let original_size = (img.width(), img.height());
 
-        // Skip correction if angle is below threshold
-        if detection.angle.abs() < options.threshold_angle {
-            img.save(output_path)
-                .map_err(|e| DeskewError::CorrectionFailed(e.to_string()))?;
-
+        if detection.angle.abs() <= options.threshold_angle {
+            std::fs::copy(input_path, output_path)?;
             return Ok(DeskewResult {
-                detection,
+                detection: detection.clone(),
                 corrected: false,
                 output_path: output_path.to_path_buf(),
                 original_size,
@@ -528,21 +564,84 @@ impl ImageProcDeskewer {
             });
         }
 
-        // Perform rotation
-        let rotated = Self::rotate_image(&img, -detection.angle, options);
+        // Page-edge detection reports dx/dy in image coordinates (y increases
+        // downward). `rotate_image` uses the same clockwise-positive image
+        // convention, so applying the measured angle straightens the edge.
+        let rotated = Self::rotate_image(&img, detection.angle, options);
         let corrected_size = (rotated.width(), rotated.height());
-
+        let parent = output_path.parent().unwrap_or_else(|| Path::new("."));
+        let format = ImageFormat::from_path(output_path)
+            .map_err(|error| DeskewError::InvalidFormat(error.to_string()))?;
+        let temporary = tempfile::NamedTempFile::new_in(parent)?;
         rotated
-            .save(output_path)
-            .map_err(|e| DeskewError::CorrectionFailed(e.to_string()))?;
+            .save_with_format(temporary.path(), format)
+            .map_err(|error| DeskewError::CorrectionFailed(error.to_string()))?;
+        temporary.as_file().sync_all()?;
+        let verified = image::ImageReader::with_format(
+            std::io::BufReader::new(std::fs::File::open(temporary.path())?),
+            format,
+        )
+        .decode()
+        .map_err(|error| DeskewError::CorrectionFailed(error.to_string()))?;
+        if verified.dimensions() != corrected_size
+            || verified.color() != rotated.color()
+            || verified.as_bytes() != rotated.as_bytes()
+        {
+            return Err(DeskewError::CorrectionFailed(
+                "deskew output verification failed".to_string(),
+            ));
+        }
+        temporary
+            .persist(output_path)
+            .map_err(|error| DeskewError::CorrectionFailed(error.to_string()))?;
 
         Ok(DeskewResult {
-            detection,
+            detection: detection.clone(),
             corrected: true,
             output_path: output_path.to_path_buf(),
             original_size,
             corrected_size,
         })
+    }
+
+    fn paths_resolve_same(input_path: &Path, output_path: &Path) -> Result<bool> {
+        #[cfg(unix)]
+        if output_path.exists() {
+            use std::os::unix::fs::MetadataExt;
+
+            let input_metadata = std::fs::metadata(input_path)?;
+            let output_metadata = std::fs::metadata(output_path)?;
+            if input_metadata.dev() == output_metadata.dev()
+                && input_metadata.ino() == output_metadata.ino()
+            {
+                return Ok(true);
+            }
+        }
+
+        #[cfg(windows)]
+        if output_path.exists() {
+            use std::os::windows::fs::MetadataExt;
+
+            let input_metadata = std::fs::metadata(input_path)?;
+            let output_metadata = std::fs::metadata(output_path)?;
+            if input_metadata.volume_serial_number() == output_metadata.volume_serial_number()
+                && input_metadata.file_index() == output_metadata.file_index()
+            {
+                return Ok(true);
+            }
+        }
+
+        let input = std::fs::canonicalize(input_path)?;
+        let output = if output_path.exists() {
+            std::fs::canonicalize(output_path)?
+        } else {
+            let parent = output_path.parent().unwrap_or_else(|| Path::new("."));
+            let file_name = output_path.file_name().ok_or_else(|| {
+                DeskewError::InvalidFormat("deskew output path has no file name".to_string())
+            })?;
+            std::fs::canonicalize(parent)?.join(file_name)
+        };
+        Ok(input == output)
     }
 
     /// Rotate image by specified angle
@@ -1195,7 +1294,7 @@ impl ImageProcDeskewer {
     /// Skew detection result with angle and confidence
     pub fn detect_skew_page_edge(
         gray: &GrayImage,
-        options: &DeskewOptions,
+        _options: &DeskewOptions,
     ) -> Result<SkewDetection> {
         let (width, height) = gray.dimensions();
         let search_width = width / 2;
@@ -1232,6 +1331,12 @@ impl ImageProcDeskewer {
         x_values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let median_x = x_values[x_values.len() / 2];
 
+        // A page-edge track must live in the outer margin. Searching deeper
+        // into the page makes vertical text columns look like scanner edges.
+        if median_x > f64::from(width) * 0.30 {
+            return SkewDetection::try_new(0.0, 0.0, 0);
+        }
+
         // Filter to points near the median (within 50 pixels)
         let inlier_threshold = 50.0;
         let inliers: Vec<(f64, f64)> = boundary_points
@@ -1247,19 +1352,44 @@ impl ImageProcDeskewer {
             });
         }
 
+        let mut longest_run = 1_usize;
+        let mut current_run = 1_usize;
+        for rows in inliers.windows(2) {
+            if (rows[1].1 - rows[0].1 - 1.0).abs() < f64::EPSILON {
+                current_run += 1;
+                longest_run = longest_run.max(current_run);
+            } else {
+                current_run = 1;
+            }
+        }
+        let continuity = longest_run as f64 / f64::from(height);
+        if continuity < 0.75 {
+            return SkewDetection::try_new(0.0, continuity, inliers.len());
+        }
+
         // Fit a line using linear regression: x = m * y + b
         let angle = Self::fit_line_angle(&inliers);
 
         match angle {
-            Some(a) => {
-                let clamped_angle = a.clamp(-options.max_angle, options.max_angle);
-                let confidence = (inliers.len() as f64 / height as f64).min(1.0);
+            Some(angle) => {
+                // Preserve the raw fitted angle. Application policy must reject
+                // out-of-range evidence rather than clamping it into eligibility.
+                let slope = angle.to_radians().tan();
+                let intercept =
+                    inliers.iter().map(|(x, y)| x - slope * y).sum::<f64>() / inliers.len() as f64;
+                let mut residuals: Vec<f64> = inliers
+                    .iter()
+                    .map(|(x, y)| (x - (slope * y + intercept)).abs())
+                    .collect();
+                residuals.sort_by(|left, right| {
+                    left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let median_residual = residuals[residuals.len() / 2];
+                let residual_score = (1.0 - median_residual / 3.0).clamp(0.0, 1.0);
+                let coverage = (inliers.len() as f64 / height as f64).min(1.0);
+                let confidence = coverage.min(continuity).min(residual_score);
 
-                Ok(SkewDetection {
-                    angle: clamped_angle,
-                    confidence,
-                    feature_count: inliers.len(),
-                })
+                SkewDetection::try_new(angle, confidence, inliers.len())
             }
             None => Ok(SkewDetection {
                 angle: 0.0,
@@ -1635,6 +1765,20 @@ mod tests {
         DynamicImage::ImageLuma8(image)
     }
 
+    fn synthetic_continuous_page_edge(angle_degrees: f64) -> GrayImage {
+        let width = 320_u32;
+        let height = 480_u32;
+        let slope = angle_degrees.to_radians().tan();
+        let mut image = GrayImage::from_pixel(width, height, Luma([255]));
+        for y in 0..height {
+            let edge = (25.0 + slope * f64::from(y)).round().clamp(6.0, 60.0) as u32;
+            for x in edge..width {
+                image.put_pixel(x, y, Luma([32]));
+            }
+        }
+        image
+    }
+
     fn assert_exact_rotation(image: DynamicImage, bytes_per_pixel: usize) {
         let dimensions = image.dimensions();
         let color = image.color();
@@ -1714,6 +1858,35 @@ mod tests {
         assert!(detection.confidence >= 0.0);
     }
 
+    #[test]
+    fn page_edge_analysis_retains_signed_raw_evidence_deterministically() {
+        let options = DeskewOptions::builder()
+            .algorithm(DeskewAlgorithm::PageEdge)
+            .max_angle(15.0)
+            .build();
+        for expected in [-2.0_f64, 2.0] {
+            let page = synthetic_continuous_page_edge(expected);
+            let first = ImageProcDeskewer::detect_skew_page_edge(&page, &options).unwrap();
+            let second = ImageProcDeskewer::detect_skew_page_edge(&page, &options).unwrap();
+            assert_eq!(first, second);
+            assert!((first.angle - expected).abs() < 0.25, "{first:?}");
+            assert!(first.confidence >= 0.90, "{first:?}");
+            assert!(first.feature_count >= 100);
+        }
+    }
+
+    #[test]
+    fn vertical_columns_without_a_continuous_margin_edge_are_not_auto_applicable() {
+        let options = DeskewOptions::builder()
+            .algorithm(DeskewAlgorithm::PageEdge)
+            .max_angle(15.0)
+            .build();
+        let detection =
+            ImageProcDeskewer::detect_skew_page_edge(&vertical_page().to_luma8(), &options)
+                .unwrap();
+        assert!(detection.confidence < crate::deskew::DEFAULT_DESKEW_MIN_CONFIDENCE);
+    }
+
     // TC-DSK-004: 傾き補正実行
     #[test]
     fn test_correct_skew() {
@@ -1759,6 +1932,146 @@ mod tests {
         .unwrap();
 
         assert!(!result.corrected);
+    }
+
+    #[test]
+    fn supplied_deskew_detection_is_applied_without_redetection() {
+        let temp_dir = tempdir().unwrap();
+        let input = temp_dir.path().join("source.png");
+        let output = temp_dir.path().join("corrected.png");
+        let mut image = RgbaImage::from_pixel(40, 60, Rgba([255, 255, 255, 255]));
+        for y in 10..50 {
+            image.put_pixel(10, y, Rgba([0, 0, 0, 255]));
+        }
+        image.save(&input).unwrap();
+
+        let detection = SkewDetection::try_new(2.0, 0.95, 150).unwrap();
+        let options = DeskewOptions::builder()
+            .max_angle(5.0)
+            .threshold_angle(0.1)
+            .quality_mode(QualityMode::HighQuality)
+            .build();
+        let result =
+            ImageProcDeskewer::correct_skew_with_detection(&input, &output, &detection, &options)
+                .unwrap();
+
+        assert!(result.corrected);
+        assert_eq!(result.detection, detection);
+        assert!(output.exists());
+        assert!(result.corrected_size.0 > result.original_size.0);
+        assert!(result.corrected_size.1 > result.original_size.1);
+    }
+
+    #[test]
+    fn supplied_deskew_detection_fails_closed_outside_transform_contract() {
+        let temp_dir = tempdir().unwrap();
+        let input = temp_dir.path().join("source.png");
+        let output = temp_dir.path().join("corrected.png");
+        RgbaImage::from_pixel(10, 10, Rgba([255, 255, 255, 255]))
+            .save(&input)
+            .unwrap();
+        let options = DeskewOptions::builder()
+            .max_angle(5.0)
+            .threshold_angle(0.1)
+            .build();
+
+        let excessive = SkewDetection::try_new(5.1, 1.0, 100).unwrap();
+        assert!(ImageProcDeskewer::correct_skew_with_detection(
+            &input, &output, &excessive, &options,
+        )
+        .is_err());
+        assert!(!output.exists());
+
+        let invalid = SkewDetection {
+            angle: f64::NAN,
+            confidence: 1.0,
+            feature_count: 100,
+        };
+        assert!(ImageProcDeskewer::correct_skew_with_detection(
+            &input, &output, &invalid, &options,
+        )
+        .is_err());
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn deskew_publication_failure_preserves_existing_destination() {
+        let temp_dir = tempdir().unwrap();
+        let input = temp_dir.path().join("source.png");
+        let output = temp_dir.path().join("destination.unsupported");
+        RgbaImage::from_pixel(20, 20, Rgba([255, 255, 255, 255]))
+            .save(&input)
+            .unwrap();
+        std::fs::write(&output, b"existing-output").unwrap();
+        let detection = SkewDetection::try_new(2.0, 1.0, 100).unwrap();
+        let options = DeskewOptions::builder()
+            .max_angle(5.0)
+            .threshold_angle(0.1)
+            .build();
+
+        assert!(ImageProcDeskewer::correct_skew_with_detection(
+            &input, &output, &detection, &options,
+        )
+        .is_err());
+        assert_eq!(std::fs::read(&output).unwrap(), b"existing-output");
+        assert!(ImageProcDeskewer::correct_skew_with_detection(
+            &input, &input, &detection, &options,
+        )
+        .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deskew_rejects_output_symlink_aliasing_source() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempdir().unwrap();
+        let input = temp_dir.path().join("source.png");
+        let alias = temp_dir.path().join("alias.png");
+        RgbaImage::from_pixel(20, 20, Rgba([255, 255, 255, 255]))
+            .save(&input)
+            .unwrap();
+        symlink(&input, &alias).unwrap();
+        let detection = SkewDetection::try_new(2.0, 1.0, 100).unwrap();
+        assert!(ImageProcDeskewer::correct_skew_with_detection(
+            &input,
+            &alias,
+            &detection,
+            &DeskewOptions::builder().max_angle(5.0).build(),
+        )
+        .is_err());
+
+        std::fs::remove_file(&alias).unwrap();
+        std::fs::hard_link(&input, &alias).unwrap();
+        assert!(ImageProcDeskewer::correct_skew_with_detection(
+            &input,
+            &alias,
+            &detection,
+            &DeskewOptions::builder().max_angle(5.0).build(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn supplied_noop_detection_copies_encoded_bytes() {
+        let temp_dir = tempdir().unwrap();
+        let input = temp_dir.path().join("source.png");
+        let output = temp_dir.path().join("copy.png");
+        RgbaImage::from_pixel(10, 10, Rgba([17, 34, 51, 255]))
+            .save(&input)
+            .unwrap();
+        let source_bytes = std::fs::read(&input).unwrap();
+        let detection = SkewDetection::try_new(0.1, 1.0, 100).unwrap();
+        let options = DeskewOptions::builder()
+            .max_angle(5.0)
+            .threshold_angle(0.1)
+            .build();
+
+        let result =
+            ImageProcDeskewer::correct_skew_with_detection(&input, &output, &detection, &options)
+                .unwrap();
+        assert!(!result.corrected);
+        assert_eq!(std::fs::read(output).unwrap(), source_bytes);
     }
 
     // TC-DSK-009: バッチ処理

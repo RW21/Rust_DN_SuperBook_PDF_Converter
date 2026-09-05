@@ -210,6 +210,9 @@ pub enum PipelineError {
     #[error("PDF extraction failed: {0}")]
     ExtractionFailed(String),
 
+    #[error("native PDF extraction failed: {0}")]
+    NativeExtraction(#[from] crate::image_extract::NativeExtractError),
+
     #[error("Image processing failed: {0}")]
     ImageProcessingFailed(String),
 
@@ -855,6 +858,14 @@ impl PdfPipeline {
     /// Get the pipeline configuration
     pub fn config(&self) -> &PipelineConfig {
         &self.config
+    }
+
+    /// Inspect every physical source page without rendering or creating a workspace.
+    pub fn inspect_native_source(
+        &self,
+        input: &Path,
+    ) -> Result<crate::image_extract::NativePdfDocument, PipelineError> {
+        crate::image_extract::NativePdfExtractor::extract_path(input).map_err(Into::into)
     }
 
     /// Analyze one decoded page and apply the configured report/apply policy.
@@ -3218,5 +3229,44 @@ mod tests {
         // On Linux, this should return Some value
         assert!(mem.is_some());
         assert!(mem.unwrap() > 0);
+    }
+
+    #[test]
+    fn native_source_inspection_preserves_physical_page_count_without_workspace() {
+        use lopdf::{dictionary, Document, Object};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("native-inspection.pdf");
+        let mut document = Document::with_version("1.7");
+        let pages_id = document.new_object_id();
+        let first = document.add_object(dictionary! {
+            "Type" => Object::Name(b"Page".to_vec()),
+            "Parent" => Object::Reference(pages_id),
+            "MediaBox" => Object::Array(vec![0.into(), 0.into(), 10.into(), 10.into()]),
+        });
+        let second = document.add_object(dictionary! {
+            "Type" => Object::Name(b"Page".to_vec()),
+            "Parent" => Object::Reference(pages_id),
+            "MediaBox" => Object::Array(vec![0.into(), 0.into(), 20.into(), 20.into()]),
+        });
+        document.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => Object::Name(b"Pages".to_vec()),
+                "Kids" => Object::Array(vec![first.into(), second.into()]),
+                "Count" => Object::Integer(2),
+            }),
+        );
+        let catalog = document.add_object(dictionary! {
+            "Type" => Object::Name(b"Catalog".to_vec()),
+            "Pages" => Object::Reference(pages_id),
+        });
+        document.trailer.set("Root", catalog);
+        document.save(&source).unwrap();
+
+        let pipeline = PdfPipeline::new(PipelineConfig::default());
+        let native = pipeline.inspect_native_source(&source).unwrap();
+        assert_eq!(native.pages().len(), 2);
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
     }
 }

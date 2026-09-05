@@ -34,6 +34,7 @@ printpdf = "0.7"
 # Image processing
 image = "0.25"
 imageproc = "0.25"
+flate2 = "1.0"
 
 # OCR
 # tesseract = "0.15"  # Uncomment when tesseract is available

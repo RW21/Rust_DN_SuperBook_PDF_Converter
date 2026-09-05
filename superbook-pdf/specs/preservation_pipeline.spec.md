@@ -275,9 +275,8 @@ The current decoded-pixel correction is retained in the manifest-ready policy ou
 Lanczos-3 interpolation, expanded canvas, opaque white RGBA fill, and RGBA8 output.
 These properties are not represented as preservation of the source pixel mode. The
 strict transform-manifest schema remains version 1; serializing this application object
-is deliberately deferred to the preservation coordinator, where it requires either a
-version-2 schema with dual-version reading or proof that version 1 was never externally
-published. Unchanged, rejected, and report-only pages have no application metadata.
+is deliberately deferred to the preservation coordinator, where it requires a
+version-2 schema with explicit version dispatch. Version 1 is not changed in place. Unchanged, rejected, and report-only pages have no application metadata.
 Geometry-only execution remains fail-closed until the native-raster writer and complete
 manifest coordinator are available. The numerical defaults are provisional conservative
 settings and must be reviewed against representative report data before production
@@ -296,6 +295,95 @@ application is enabled.
 - Apply uses the supplied detection once, records its lossy decoded-pixel properties,
   and becomes `applied` only after the output write succeeds.
 - Analysis, copy, and transform publication errors fail closed.
+
+## Task 5: Native PDF Page Inventory
+
+Native preservation inspection is a separate API from the legacy DPI-controlled render
+extractors. It accepts only a source PDF path and emits exactly one `NativePageRecord`
+for every physical page returned by the PDF page tree, in that order. It never scans
+orphan objects as a fallback, never invokes ImageMagick or Poppler, and never renders at
+a configured DPI. The strict native loader rejects broken page trees (missing nodes,
+duplicate/cyclic children, mismatched Parent links or Count values) rather than returning
+partial inventories. Traversal is bounded to 128 levels and 100,000 tree nodes. Legacy
+reader and raster extraction behavior remain separate; native loading never enters the
+legacy A4 fallback or recursive geometry helper. Encrypted inputs are rejected.
+
+Each page record carries its zero-based index, one-based source page number, page object
+identity, effective inherited `MediaBox`, optional effective inherited `CropBox`, and
+raw inherited rotation together with the object on which each inherited value was
+defined. The effective rotation is normalized only after verifying that the raw value is
+a multiple of 90 degrees. Missing, malformed, non-finite, or degenerate required
+geometry is retained as a typed page failure rather than replaced with an arbitrary A4
+or zero default.
+
+Image discovery follows the page content's `Do` operations through named XObjects and
+nested Form XObjects, with bounded recursion and cycle detection. It records the full
+resource-owner/name path, invocation count, and effective six-value placement matrix so
+Task 6 can perform page-local copy-on-write replacement without guessing. Merely
+appearing in a resource dictionary does not prove that an image is painted. A direct
+reusable page has exactly one painted image occurrence and no visible text, vector,
+shading, or inline-image painting. No-content pages are `blank`; non-image content,
+inline images, malformed content, unresolved XObjects, recursive Forms, repeated image
+placement, and multiple image invocations remain present but require review. The
+preservation API does not guess that the largest resource is the page scan.
+
+For every identified image object, native metadata includes object identity, encoded
+stream length and SHA-256, dimensions, color space, bits per component, the complete
+filter chain, and canonical decode parameters. The native document retains access to
+the loaded source stream and complete object graph without exposing `lopdf` objects in
+the public API. The original object identity and stream hash are the reuse contract for
+unchanged pages; Task 6 reuses the cloned source graph rather than shallow-copying an
+image that can reference masks, ICC profiles, or indexed color spaces. Transform decode
+capability is reported separately; unsupported decoding, including CCITT until a
+validated decoder exists, blocks geometry application for that page rather than
+triggering a renderer or lower-DPI fallback. Manifest schema version 1 is unchanged;
+its existing `SourceImageMetadata` is populated only when a single source image has
+been identified unambiguously and every field can be represented losslessly. Complex
+metadata that cannot be projected to schema version 1 fails projection explicitly.
+
+Native decoding is an explicit separate request with an output-sample byte budget,
+not an effect of inspection. The initial decoder accepts 8-bit DeviceGray/DeviceRGB
+Flate without prediction and baseline 8-bit DCT, revalidates the supplied metadata and
+encoded hash against the loaded object, and verifies decoded dimensions and pixel mode.
+DCT decoding retains the codec's native samples; it cannot recover pre-JPEG originals.
+The caller budget is hard-capped at 256 MiB of samples; encoded input is separately
+capped at 256 MiB. Codec working memory is not claimed to fit the sample budget.
+Masks, custom Decode arrays, predictors, complex color spaces, CCITT and other unsupported
+image semantics are never passed to the legacy renderer as a fallback. They remain
+available as unchanged source objects for the future writer.
+
+Content decoding accepts unfiltered and strictly validated Flate streams only. Missing
+references, malformed/truncated compression, unconsumed parser suffixes, over-limit
+content, inline images, clipping, optional content, and unmodeled graphics state produce
+page-scoped review issues. Nested Forms retain their image bindings and matrices but
+require review because their BBox clipping/group semantics are not modeled yet. There
+is no claim that a `SingleImage` classification alone authorizes a future transform.
+
+### Task 5 test cases
+
+- Reverse object registration cannot alter physical page-tree order.
+- Direct-image, truly blank, nested-Form image, multi-image, and non-image pages each
+  produce one record with the required classification and review flag.
+- Inherited `MediaBox`, `CropBox`, rotation, and resources are resolved without A4
+  substitution; invalid required geometry is recorded as an issue.
+- DCT RGB, Flate grayscale, and CCITT bilevel streams retain dimensions, color space,
+  bit depth, filter chain, decode parameters, encoded length, and encoded SHA-256.
+- Repeated image invocations, unresolved names, inline images, malformed content, and
+  Form cycles fail closed at page scope without changing record cardinality.
+- Native inspection has no DPI argument and creates no raster files.
+
+### Task 6 handoff contract
+
+The first preservation writer consumes the Task 5 inventory and a clone of the same
+loaded source document. Unchanged pages are not mutated. A transformed page is eligible
+only when its inventory has one direct image binding with a verified placement matrix
+and a supported lossless decoder. The writer adds a new losslessly encoded image object
+and performs page-local copy-on-write resource rebinding; it never overwrites a shared
+source image or shared inherited resource dictionary. Nested-Form rewrites remain
+unchanged and review-required until copy-on-write along the complete Form/resource path
+is implemented and tested. The writer must reload staged output and verify page order,
+page geometry, unchanged object IDs and encoded hashes, and changed decoded-raster hashes
+before any transform can become `applied` or any PDF/manifest pair can be published.
 
 ### Transform manifest test cases
 

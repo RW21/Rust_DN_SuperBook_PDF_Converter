@@ -19,7 +19,9 @@
 //! println!("Title: {:?}", reader.info.metadata.title);
 //! ```
 
-use lopdf::Document;
+use crate::transform_manifest::PdfObjectId;
+use lopdf::{Document, Object, ObjectId};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -84,6 +86,114 @@ pub struct PdfPage {
     pub has_text: bool,
 }
 
+/// Exact PDF rectangle coordinates, including a non-zero origin.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PdfRect([f64; 4]);
+
+/// Invalid or non-positive PDF rectangle.
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+#[error("PDF rectangle requires finite coordinates and positive finite dimensions")]
+pub struct InvalidPdfRect;
+
+impl PdfRect {
+    pub fn try_new(coordinates: [f64; 4]) -> std::result::Result<Self, InvalidPdfRect> {
+        if !coordinates.iter().all(|value| value.is_finite())
+            || coordinates[2] <= coordinates[0]
+            || coordinates[3] <= coordinates[1]
+            || !(coordinates[2] - coordinates[0]).is_finite()
+            || !(coordinates[3] - coordinates[1]).is_finite()
+        {
+            return Err(InvalidPdfRect);
+        }
+        Ok(Self(coordinates.map(|value| {
+            if value == 0.0 {
+                0.0
+            } else {
+                value
+            }
+        })))
+    }
+
+    #[must_use]
+    pub const fn coordinates(self) -> [f64; 4] {
+        self.0
+    }
+}
+
+/// An inherited page-tree value and the object that defined it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InheritedPageValue<T> {
+    pub value: T,
+    pub defined_on: PdfObjectId,
+}
+
+/// Stable physical-page geometry failure classifications.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhysicalPageIssue {
+    MissingMediaBox,
+    InvalidMediaBox,
+    InvalidCropBox,
+    InvalidRotation,
+    InvalidParentChain,
+}
+
+impl PhysicalPageIssue {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MissingMediaBox => "missing_media_box",
+            Self::InvalidMediaBox => "invalid_media_box",
+            Self::InvalidCropBox => "invalid_crop_box",
+            Self::InvalidRotation => "invalid_rotation",
+            Self::InvalidParentChain => "invalid_parent_chain",
+        }
+    }
+}
+
+/// Page-tree identity and effective inherited geometry for one physical page.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PhysicalPageMetadata {
+    pub page_index: usize,
+    pub source_page_number: usize,
+    pub page_object_id: PdfObjectId,
+    pub media_box: Option<InheritedPageValue<PdfRect>>,
+    pub crop_box: Option<InheritedPageValue<PdfRect>>,
+    pub raw_rotation: Option<InheritedPageValue<i32>>,
+    pub issues: Vec<PhysicalPageIssue>,
+}
+
+impl PhysicalPageMetadata {
+    #[must_use]
+    pub fn effective_crop_box(&self) -> Option<PdfRect> {
+        if self.issues.contains(&PhysicalPageIssue::InvalidCropBox)
+            || self.issues.contains(&PhysicalPageIssue::InvalidParentChain)
+        {
+            return None;
+        }
+        self.crop_box
+            .as_ref()
+            .map(|value| value.value)
+            .or_else(|| self.media_box.as_ref().map(|value| value.value))
+    }
+
+    #[must_use]
+    pub fn normalized_rotation(&self) -> Option<u16> {
+        if self.issues.contains(&PhysicalPageIssue::InvalidRotation)
+            || self.issues.contains(&PhysicalPageIssue::InvalidParentChain)
+        {
+            return None;
+        }
+        self.raw_rotation
+            .as_ref()
+            .map_or(Some(0), |value| Some(value.value.rem_euclid(360) as u16))
+    }
+
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        self.issues.is_empty()
+    }
+}
+
 /// PDF Reader trait
 pub trait PdfReader {
     /// Open a PDF file
@@ -106,6 +216,7 @@ pub trait PdfReader {
 pub struct LopdfReader {
     #[allow(dead_code)]
     document: Document,
+    physical_pages: Vec<PhysicalPageMetadata>,
     pub info: PdfDocument,
 }
 
@@ -131,9 +242,11 @@ impl LopdfReader {
         let page_count = document.get_pages().len();
         let metadata = Self::extract_metadata(&document);
         let pages = Self::extract_pages(&document)?;
+        let physical_pages = Self::extract_physical_pages(&document)?;
 
         Ok(Self {
             document,
+            physical_pages,
             info: PdfDocument {
                 path: path.to_path_buf(),
                 page_count,
@@ -142,6 +255,302 @@ impl LopdfReader {
                 is_encrypted,
             },
         })
+    }
+
+    /// Strict preservation loader. Never calls legacy geometry/default routines.
+    pub(crate) fn new_native(path: &Path) -> Result<Self> {
+        if !path.exists() {
+            return Err(PdfReaderError::FileNotFound(path.to_path_buf()));
+        }
+        let document =
+            Document::load(path).map_err(|error| PdfReaderError::ParseError(error.to_string()))?;
+        // The presence of Encrypt is sufficient: a library may already have
+        // decrypted a document with an empty password during loading.
+        if document.trailer.has(b"Encrypt") || document.is_encrypted() {
+            return Err(PdfReaderError::EncryptedPdf);
+        }
+        let ids = Self::strict_page_ids(&document)?;
+        let physical_pages = Self::physical_metadata_for_ids(&document, ids)?;
+        let info = PdfDocument {
+            path: path.to_path_buf(),
+            page_count: physical_pages.len(),
+            metadata: Self::extract_metadata(&document),
+            // Native consumers use physical_pages, never the legacy lossy view.
+            pages: Vec::new(),
+            is_encrypted: false,
+        };
+        Ok(Self {
+            document,
+            physical_pages,
+            info,
+        })
+    }
+
+    fn strict_page_ids(doc: &Document) -> Result<Vec<ObjectId>> {
+        let invalid = |message: &str| PdfReaderError::InvalidFormat(message.to_string());
+        let catalog_id = doc
+            .trailer
+            .get(b"Root")
+            .and_then(Object::as_reference)
+            .map_err(|_| invalid("missing catalog reference"))?;
+        let catalog = doc
+            .objects
+            .get(&catalog_id)
+            .and_then(|object| object.as_dict().ok())
+            .ok_or_else(|| invalid("invalid catalog dictionary"))?;
+        let root = catalog
+            .get(b"Pages")
+            .and_then(Object::as_reference)
+            .map_err(|_| invalid("missing page-tree reference"))?;
+        let mut seen = HashSet::new();
+        let mut pages = Vec::new();
+        Self::walk_strict_pages(doc, root, None, 0, &mut seen, &mut pages)?;
+        if pages.is_empty() {
+            return Err(invalid("empty page tree"));
+        }
+        Ok(pages)
+    }
+
+    fn walk_strict_pages(
+        doc: &Document,
+        id: ObjectId,
+        parent: Option<ObjectId>,
+        depth: usize,
+        seen: &mut HashSet<ObjectId>,
+        pages: &mut Vec<ObjectId>,
+    ) -> Result<usize> {
+        let invalid = |message: &str| PdfReaderError::InvalidFormat(message.to_string());
+        if depth >= 128 || seen.len() >= 100_000 || !seen.insert(id) {
+            return Err(invalid("cyclic, duplicated, or over-limit page tree"));
+        }
+        let dict = doc
+            .objects
+            .get(&id)
+            .and_then(|object| object.as_dict().ok())
+            .ok_or_else(|| invalid("unresolved page-tree dictionary"))?;
+        if let Some(parent) = parent {
+            if dict.get(b"Parent").and_then(Object::as_reference).ok() != Some(parent) {
+                return Err(invalid("page-tree Parent does not match Kids"));
+            }
+        } else if dict.has(b"Parent") {
+            return Err(invalid("root page-tree node has a Parent"));
+        }
+        match dict.get(b"Type").and_then(Object::as_name_str).ok() {
+            Some("Page") if parent.is_some() => {
+                if dict.has(b"Kids") {
+                    return Err(invalid("Page node has Kids"));
+                }
+                pages.push(id);
+                Ok(1)
+            }
+            Some("Pages") => {
+                let kids = dict
+                    .get(b"Kids")
+                    .and_then(Object::as_array)
+                    .map_err(|_| invalid("invalid page-tree Kids array"))?;
+                if kids.len() > 100_000 {
+                    return Err(invalid("over-limit Kids array"));
+                }
+                let declared = dict
+                    .get(b"Count")
+                    .and_then(Object::as_i64)
+                    .ok()
+                    .and_then(|value| usize::try_from(value).ok())
+                    .ok_or_else(|| invalid("invalid page-tree Count"))?;
+                let mut actual = 0usize;
+                for kid in kids {
+                    let kid = kid
+                        .as_reference()
+                        .map_err(|_| invalid("Kids entry is not a reference"))?;
+                    actual = actual
+                        .checked_add(Self::walk_strict_pages(
+                            doc,
+                            kid,
+                            Some(id),
+                            depth + 1,
+                            seen,
+                            pages,
+                        )?)
+                        .ok_or_else(|| invalid("page count overflow"))?;
+                }
+                if actual != declared {
+                    return Err(invalid("page-tree Count disagrees with physical pages"));
+                }
+                Ok(actual)
+            }
+            _ => Err(invalid("invalid page-tree node Type")),
+        }
+    }
+
+    /// Physical page-tree records with exact inherited geometry and provenance.
+    #[must_use]
+    pub fn physical_pages(&self) -> &[PhysicalPageMetadata] {
+        &self.physical_pages
+    }
+
+    /// Parsed source document for preservation-only crate internals.
+    pub(crate) fn document(&self) -> &Document {
+        &self.document
+    }
+
+    fn extract_physical_pages(doc: &Document) -> Result<Vec<PhysicalPageMetadata>> {
+        Self::physical_metadata_for_ids(doc, doc.get_pages().into_values().collect())
+    }
+
+    fn physical_metadata_for_ids(
+        doc: &Document,
+        ids: Vec<ObjectId>,
+    ) -> Result<Vec<PhysicalPageMetadata>> {
+        ids.into_iter()
+            .enumerate()
+            .map(|(page_index, page_id)| {
+                let mut issues = Vec::new();
+                let media_box = match Self::inherited_page_object(doc, page_id, b"MediaBox") {
+                    Ok(Some((value, defined_on))) => match Self::parse_rect(doc, &value) {
+                        Some(value) => Some(InheritedPageValue {
+                            value,
+                            defined_on: Self::manifest_object_id(defined_on),
+                        }),
+                        None => {
+                            issues.push(PhysicalPageIssue::InvalidMediaBox);
+                            None
+                        }
+                    },
+                    Ok(None) => {
+                        issues.push(PhysicalPageIssue::MissingMediaBox);
+                        None
+                    }
+                    Err(()) => {
+                        issues.push(PhysicalPageIssue::InvalidParentChain);
+                        None
+                    }
+                };
+                let crop_box = match Self::inherited_page_object(doc, page_id, b"CropBox") {
+                    Ok(Some((value, defined_on))) => match Self::parse_rect(doc, &value) {
+                        Some(value) => Some(InheritedPageValue {
+                            value,
+                            defined_on: Self::manifest_object_id(defined_on),
+                        }),
+                        None => {
+                            issues.push(PhysicalPageIssue::InvalidCropBox);
+                            None
+                        }
+                    },
+                    Ok(None) => None,
+                    Err(()) => {
+                        issues.push(PhysicalPageIssue::InvalidParentChain);
+                        None
+                    }
+                };
+                let raw_rotation = match Self::inherited_page_object(doc, page_id, b"Rotate") {
+                    Ok(Some((value, defined_on))) => match Self::parse_rotation(doc, &value) {
+                        Some(value) => Some(InheritedPageValue {
+                            value,
+                            defined_on: Self::manifest_object_id(defined_on),
+                        }),
+                        None => {
+                            issues.push(PhysicalPageIssue::InvalidRotation);
+                            None
+                        }
+                    },
+                    Ok(None) => None,
+                    Err(()) => {
+                        issues.push(PhysicalPageIssue::InvalidParentChain);
+                        None
+                    }
+                };
+                issues.sort_by_key(|issue| issue.as_str());
+                issues.dedup();
+
+                Ok(PhysicalPageMetadata {
+                    page_index,
+                    source_page_number: page_index.checked_add(1).ok_or_else(|| {
+                        PdfReaderError::ParseError("source page number overflow".to_string())
+                    })?,
+                    page_object_id: Self::manifest_object_id(page_id),
+                    media_box,
+                    crop_box,
+                    raw_rotation,
+                    issues,
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) fn inherited_page_object(
+        doc: &Document,
+        page_id: ObjectId,
+        key: &[u8],
+    ) -> std::result::Result<Option<(Object, ObjectId)>, ()> {
+        let mut current = Some(page_id);
+        let mut seen = HashSet::new();
+        while let Some(object_id) = current {
+            if seen.len() >= 128 || !seen.insert(object_id) {
+                return Err(());
+            }
+            let dictionary = doc
+                .objects
+                .get(&object_id)
+                .and_then(|object| object.as_dict().ok())
+                .ok_or(())?;
+            if let Ok(value) = dictionary.get(key) {
+                return Ok(Some((value.clone(), object_id)));
+            }
+            current = match dictionary.get(b"Parent") {
+                Ok(Object::Reference(parent)) => Some(*parent),
+                Ok(_) => return Err(()),
+                Err(_) => None,
+            };
+        }
+        Ok(None)
+    }
+
+    fn parse_rect(doc: &Document, value: &Object) -> Option<PdfRect> {
+        let resolved = Self::resolve_object_for_geometry(doc, value)?;
+        let values = resolved.as_array().ok()?;
+        if values.len() != 4 {
+            return None;
+        }
+        let mut coordinates = [0.0; 4];
+        for (destination, source) in coordinates.iter_mut().zip(values) {
+            let source = Self::resolve_object_for_geometry(doc, source)?;
+            *destination = match source {
+                Object::Integer(value) => *value as f64,
+                Object::Real(value) => f64::from(*value),
+                _ => return None,
+            };
+        }
+        PdfRect::try_new(coordinates).ok()
+    }
+
+    fn parse_rotation(doc: &Document, value: &Object) -> Option<i32> {
+        let value = Self::resolve_object_for_geometry(doc, value)?;
+        let value = value.as_i64().ok()?;
+        let value = i32::try_from(value).ok()?;
+        (value % 90 == 0).then_some(value)
+    }
+
+    fn resolve_object_for_geometry<'a>(doc: &'a Document, value: &'a Object) -> Option<&'a Object> {
+        let mut current = value;
+        let mut seen = HashSet::new();
+        loop {
+            match current {
+                Object::Reference(object_id) => {
+                    if seen.len() >= 128 || !seen.insert(*object_id) {
+                        return None;
+                    }
+                    current = doc.objects.get(object_id)?;
+                }
+                _ => return Some(current),
+            }
+        }
+    }
+
+    const fn manifest_object_id(object_id: ObjectId) -> PdfObjectId {
+        PdfObjectId {
+            object_number: object_id.0,
+            generation: object_id.1,
+        }
     }
 
     /// Extract metadata from PDF document
@@ -1754,5 +2163,244 @@ mod tests {
         assert_eq!(cloned.page_count, doc.page_count);
         assert_eq!(cloned.path, doc.path);
         assert_eq!(cloned.metadata.title, doc.metadata.title);
+    }
+
+    #[test]
+    fn physical_page_metadata_preserves_inherited_values_and_provenance() {
+        use lopdf::{dictionary, Document, Object};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("physical-pages.pdf");
+        let mut doc = Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let first_id = doc.add_object(dictionary! {
+            "Type" => Object::Name(b"Page".to_vec()),
+            "Parent" => Object::Reference(pages_id),
+        });
+        let second_id = doc.add_object(dictionary! {
+            "Type" => Object::Name(b"Page".to_vec()),
+            "Parent" => Object::Reference(pages_id),
+            "CropBox" => Object::Array(vec![11.into(), 12.into(), 311.into(), 512.into()]),
+            "Rotate" => Object::Integer(180),
+        });
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => Object::Name(b"Pages".to_vec()),
+                "Kids" => Object::Array(vec![first_id.into(), second_id.into()]),
+                "Count" => Object::Integer(2),
+                "MediaBox" => Object::Array(vec![1.into(), 2.into(), 401.into(), 602.into()]),
+                "CropBox" => Object::Array(vec![3.into(), 4.into(), 399.into(), 600.into()]),
+                "Rotate" => Object::Integer(-90),
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => Object::Name(b"Catalog".to_vec()),
+            "Pages" => Object::Reference(pages_id),
+        });
+        doc.trailer.set("Root", catalog_id);
+        doc.save(&path).unwrap();
+
+        let reader = LopdfReader::new(&path).unwrap();
+        let pages = reader.physical_pages();
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0].page_index, 0);
+        assert_eq!(pages[0].source_page_number, 1);
+        assert_eq!(pages[0].page_object_id.object_number, first_id.0);
+        assert_eq!(
+            pages[0]
+                .media_box
+                .as_ref()
+                .unwrap()
+                .defined_on
+                .object_number,
+            pages_id.0
+        );
+        assert_eq!(
+            pages[0].media_box.as_ref().unwrap().value.coordinates(),
+            [1.0, 2.0, 401.0, 602.0]
+        );
+        assert_eq!(
+            pages[0].crop_box.as_ref().unwrap().defined_on.object_number,
+            pages_id.0
+        );
+        assert_eq!(pages[0].raw_rotation.as_ref().unwrap().value, -90);
+        assert_eq!(pages[0].normalized_rotation(), Some(270));
+        assert!(pages[0].issues.is_empty());
+
+        assert_eq!(pages[1].page_object_id.object_number, second_id.0);
+        assert_eq!(
+            pages[1].crop_box.as_ref().unwrap().defined_on.object_number,
+            second_id.0
+        );
+        assert_eq!(
+            pages[1]
+                .raw_rotation
+                .as_ref()
+                .unwrap()
+                .defined_on
+                .object_number,
+            second_id.0
+        );
+        assert_eq!(pages[1].normalized_rotation(), Some(180));
+    }
+
+    #[test]
+    fn native_loader_does_not_enter_legacy_geometry_recursion() {
+        use lopdf::dictionary;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cyclic-geometry.pdf");
+        let mut doc = Document::with_version("1.7");
+        let root = doc.new_object_id();
+        let cyclic = doc.new_object_id();
+        doc.objects.insert(cyclic, Object::Reference(cyclic));
+        let page = doc.add_object(dictionary! {
+            "Type" => "Page", "Parent" => root,
+            "MediaBox" => cyclic, "CropBox" => cyclic, "Rotate" => cyclic,
+        });
+        doc.objects.insert(
+            root,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages", "Kids" => vec![page.into()], "Count" => 1,
+            }),
+        );
+        let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => root });
+        doc.trailer.set("Root", catalog);
+        doc.save(&path).unwrap();
+        let reader = LopdfReader::new_native(&path).unwrap();
+        let page = &reader.physical_pages()[0];
+        assert_eq!(reader.info.page_count, 1);
+        assert!(page.issues.contains(&PhysicalPageIssue::InvalidMediaBox));
+        assert!(page.issues.contains(&PhysicalPageIssue::InvalidCropBox));
+        assert!(page.issues.contains(&PhysicalPageIssue::InvalidRotation));
+        assert!(page.effective_crop_box().is_none());
+        assert!(page.normalized_rotation().is_none());
+    }
+
+    #[test]
+    fn native_geometry_rejects_overflow_and_inheritance_cycles() {
+        use lopdf::dictionary;
+        assert!(PdfRect::try_new([-f64::MAX, 0.0, f64::MAX, 1.0]).is_err());
+        let mut doc = Document::with_version("1.7");
+        let page = doc.new_object_id();
+        doc.objects.insert(
+            page,
+            Object::Dictionary(dictionary! {
+                "Type" => "Page", "Parent" => page,
+            }),
+        );
+        let records = LopdfReader::physical_metadata_for_ids(&doc, vec![page]).unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(records[0]
+            .issues
+            .contains(&PhysicalPageIssue::InvalidParentChain));
+        assert!(records[0].normalized_rotation().is_none());
+        assert!(records[0].effective_crop_box().is_none());
+    }
+
+    #[test]
+    fn native_page_tree_rejects_missing_duplicate_and_miscounted_children() {
+        use lopdf::dictionary;
+        let mut doc = Document::with_version("1.7");
+        let root = doc.new_object_id();
+        let leaf = doc.add_object(dictionary! {
+            "Type" => "Page", "Parent" => root,
+            "MediaBox" => vec![0.into(), 0.into(), 10.into(), 10.into()],
+        });
+        doc.objects.insert(
+            root,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages", "Kids" => vec![leaf.into()], "Count" => 1,
+            }),
+        );
+        let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => root });
+        doc.trailer.set("Root", catalog);
+        assert_eq!(LopdfReader::strict_page_ids(&doc).unwrap(), vec![leaf]);
+        for (kids, count) in [
+            (vec![leaf.into(), leaf.into()], 2),
+            (vec![Object::Reference((9999, 0))], 1),
+            (vec![leaf.into()], 2),
+            (vec![root.into()], 1),
+            (vec![Object::Integer(42)], 1),
+        ] {
+            doc.objects.insert(
+                root,
+                Object::Dictionary(dictionary! {
+                    "Type" => "Pages", "Kids" => kids, "Count" => count,
+                }),
+            );
+            assert!(LopdfReader::strict_page_ids(&doc).is_err());
+        }
+    }
+
+    #[test]
+    fn native_page_tree_keeps_nested_kids_order_and_rejects_wrong_parent() {
+        use lopdf::dictionary;
+        let mut doc = Document::with_version("1.7");
+        let root = doc.new_object_id();
+        let branch = doc.new_object_id();
+        let second = doc.add_object(dictionary! { "Type" => "Page", "Parent" => root });
+        let first = doc.add_object(dictionary! { "Type" => "Page", "Parent" => branch });
+        doc.objects.insert(
+            branch,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages", "Parent" => root, "Kids" => vec![first.into()], "Count" => 1,
+            }),
+        );
+        doc.objects.insert(
+            root,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages", "Kids" => vec![branch.into(), second.into()], "Count" => 2,
+            }),
+        );
+        let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => root });
+        doc.trailer.set("Root", catalog);
+        assert_eq!(
+            LopdfReader::strict_page_ids(&doc).unwrap(),
+            vec![first, second]
+        );
+        doc.get_object_mut(first)
+            .unwrap()
+            .as_dict_mut()
+            .unwrap()
+            .set("Parent", root);
+        assert!(LopdfReader::strict_page_ids(&doc).is_err());
+    }
+
+    #[test]
+    fn physical_page_metadata_reports_invalid_geometry_without_defaults() {
+        use lopdf::{dictionary, Document, Object};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("invalid-physical-page.pdf");
+        let mut doc = Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let page_id = doc.add_object(dictionary! {
+            "Type" => Object::Name(b"Page".to_vec()),
+            "Parent" => Object::Reference(pages_id),
+            "Rotate" => Object::Integer(45),
+        });
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => Object::Name(b"Pages".to_vec()),
+                "Kids" => Object::Array(vec![page_id.into()]),
+                "Count" => Object::Integer(1),
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => Object::Name(b"Catalog".to_vec()),
+            "Pages" => Object::Reference(pages_id),
+        });
+        doc.trailer.set("Root", catalog_id);
+        doc.save(&path).unwrap();
+
+        let reader = LopdfReader::new(&path).unwrap();
+        let page = &reader.physical_pages()[0];
+        assert!(page.media_box.is_none());
+        assert_eq!(page.normalized_rotation(), None);
+        assert!(page.issues.contains(&PhysicalPageIssue::MissingMediaBox));
+        assert!(page.issues.contains(&PhysicalPageIssue::InvalidRotation));
+        assert!(PdfRect::try_new([10.0, 0.0, 0.0, 10.0]).is_err());
     }
 }

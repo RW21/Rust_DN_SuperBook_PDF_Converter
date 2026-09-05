@@ -184,7 +184,10 @@ pub use deskew::{
 };
 pub use image_extract::{
     ColorSpace, ExtractError, ExtractOptions, ExtractOptionsBuilder, ExtractedPage, ImageFormat,
-    LopdfExtractor, MagickExtractor,
+    LopdfExtractor, MagickExtractor, ManifestV1ProjectionError, NativeExtractError,
+    NativeImageBinding, NativeImageInvocation, NativeImageMetadata, NativePageIssue,
+    NativePageIssueCode, NativePageKind, NativePageRecord, NativePdfDocument, NativePdfExtractor,
+    NativeResourcePathStep, NativeTransformDecodeCapability, PdfMatrix,
 };
 pub use margin::{
     ContentDetectionMode, ContentRect, GroupCropAnalyzer, GroupCropRegion, ImageMarginDetector,
@@ -198,7 +201,10 @@ pub use page_number::{
     PageNumberMatch, PageNumberOptions, PageNumberOptionsBuilder, PageNumberPosition,
     PageNumberRect, PageOffsetAnalyzer, PageOffsetResult, Point, Rectangle, TesseractPageDetector,
 };
-pub use pdf_reader::{LopdfReader, PdfDocument, PdfMetadata, PdfPage, PdfReaderError};
+pub use pdf_reader::{
+    InheritedPageValue, InvalidPdfRect, LopdfReader, PdfDocument, PdfMetadata, PdfPage,
+    PdfReaderError, PdfRect, PhysicalPageIssue, PhysicalPageMetadata,
+};
 pub use pdf_writer::{
     find_cjk_font, PdfViewerHints, PdfWriterError, PdfWriterOptions, PdfWriterOptionsBuilder,
     PrintPdfWriter,

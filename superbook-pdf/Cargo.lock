@@ -2360,6 +2360,7 @@ dependencies = [
  "criterion",
  "dashmap",
  "dirs",
+ "flate2",
  "image",
  "imageproc",
  "indicatif",

@@ -33,9 +33,342 @@
 //! // );
 //! ```
 
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use thiserror::Error;
+
+#[cfg(test)]
+mod native_hardening_tests {
+    use super::*;
+    use lopdf::{dictionary, Document, Object, Stream};
+    use std::io::Write;
+
+    fn flate(bytes: &[u8]) -> Vec<u8> {
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn image_stream(jpeg: bool, rgb: bool) -> Stream {
+        let pixels = if rgb {
+            [30, 60, 90].repeat(4)
+        } else {
+            vec![30, 60, 90, 120]
+        };
+        let bytes = if jpeg {
+            let mut bytes = Vec::new();
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, 100)
+                .encode(
+                    &pixels,
+                    2,
+                    2,
+                    if rgb {
+                        image::ExtendedColorType::Rgb8
+                    } else {
+                        image::ExtendedColorType::L8
+                    },
+                )
+                .unwrap();
+            bytes
+        } else {
+            flate(&pixels)
+        };
+        Stream::new(
+            dictionary! {
+                "Type" => "XObject", "Subtype" => "Image", "Width" => 2, "Height" => 2,
+                "ColorSpace" => if rgb { "DeviceRGB" } else { "DeviceGray" },
+                "BitsPerComponent" => 8, "Filter" => if jpeg { "DCTDecode" } else { "FlateDecode" },
+            },
+            bytes,
+        )
+    }
+
+    fn fixture(stream: Stream, contents: Vec<Object>) -> (Document, lopdf::ObjectId) {
+        let mut doc = Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let image_id = doc.add_object(stream);
+        let mut kids = Vec::new();
+        for content in contents {
+            let content = match content {
+                Object::Stream(stream) => Object::Reference(doc.add_object(stream)),
+                other => other,
+            };
+            kids.push(Object::Reference(doc.add_object(dictionary! {
+                "Type" => "Page", "Parent" => pages_id,
+                "MediaBox" => vec![0.into(), 0.into(), 10.into(), 10.into()],
+                "Contents" => content,
+                "Resources" => dictionary! { "XObject" => dictionary! { "Scan" => image_id } },
+            })));
+        }
+        let count = kids.len() as i64;
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages", "Kids" => kids, "Count" => count,
+            }),
+        );
+        let root = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        doc.trailer.set("Root", root);
+        (doc, image_id)
+    }
+
+    fn content(bytes: &[u8]) -> Object {
+        Object::Stream(Stream::new(dictionary! {}, bytes.to_vec()))
+    }
+
+    fn load(doc: &mut Document) -> (tempfile::TempDir, NativePdfDocument) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("synthetic.pdf");
+        doc.save(&path).unwrap();
+        let native = NativePdfExtractor::extract_path(&path).unwrap();
+        (dir, native)
+    }
+
+    #[test]
+    fn native_decode_valid_streams_losslessly_and_bounded() {
+        for jpeg in [false, true] {
+            for rgb in [false, true] {
+                let stream = image_stream(jpeg, rgb);
+                let expected = if jpeg {
+                    image::load_from_memory_with_format(&stream.content, image::ImageFormat::Jpeg)
+                        .unwrap()
+                        .into_bytes()
+                } else if rgb {
+                    [30, 60, 90].repeat(4)
+                } else {
+                    vec![30, 60, 90, 120]
+                };
+                let (mut doc, _) = fixture(stream, vec![content(b"/Scan Do")]);
+                let (_dir, native) = load(&mut doc);
+                let meta = &native.pages()[0].image_invocations[0].metadata;
+                let image = native.decode_image(meta, expected.len() as u64).unwrap();
+                assert_eq!((image.width(), image.height()), (2, 2));
+                assert_eq!(image.as_bytes(), expected);
+                assert!(native
+                    .decode_image(meta, expected.len() as u64 - 1)
+                    .is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn native_decode_rejects_hash_and_metadata_tamper_and_preserves_clone_reload() {
+        let (mut doc, image_id) = fixture(image_stream(false, false), vec![content(b"/Scan Do")]);
+        let (dir, native) = load(&mut doc);
+        let meta = &native.pages()[0].image_invocations[0].metadata;
+        let mut tampered = meta.clone();
+        tampered.encoded_sha256 = "0".repeat(64);
+        assert!(matches!(
+            native.decode_image(&tampered, 1024),
+            Err(NativeExtractError::ImageHashMismatch(_))
+        ));
+        tampered = meta.clone();
+        tampered.width += 1;
+        assert!(native.decode_image(&tampered, 1024).is_err());
+        let mut cloned = native.source_document().clone();
+        let path = dir.path().join("clone.pdf");
+        cloned.save(&path).unwrap();
+        let reloaded = NativePdfExtractor::extract_path(&path).unwrap();
+        assert_eq!(reloaded.pages(), native.pages());
+        assert_eq!(
+            reloaded.encoded_image_bytes(meta).unwrap(),
+            native.encoded_image_bytes(meta).unwrap()
+        );
+        assert_eq!(
+            reloaded.source_document().get_object(image_id).unwrap(),
+            native.source_document().get_object(image_id).unwrap()
+        );
+    }
+
+    #[test]
+    fn native_metadata_rejects_malformed_filters_and_cycles() {
+        let mut doc = Document::new();
+        let cycle = doc.new_object_id();
+        doc.objects.insert(cycle, Object::Reference(cycle));
+        for value in [
+            Object::Integer(42),
+            Object::Null,
+            Object::Array(vec![Object::Integer(42)]),
+            Object::Reference(cycle),
+        ] {
+            let mut stream = image_stream(false, false);
+            stream.dict.set("Filter", value);
+            assert!(LopdfExtractor::native_image_metadata(&doc, (100, 0), &stream).is_err());
+        }
+        for key in ["ColorSpace", "DecodeParms", "BitsPerComponent"] {
+            let mut stream = image_stream(false, false);
+            stream.dict.set(key, Object::Reference(cycle));
+            assert!(
+                LopdfExtractor::native_image_metadata(&doc, (100, 0), &stream).is_err(),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_metadata_expansion_has_a_shared_budget() {
+        let mut doc = Document::new();
+        let mut value = Object::Integer(1);
+        for _ in 0..14 {
+            let id = doc.add_object(Object::Array(vec![value.clone(), value]));
+            value = Object::Reference(id);
+        }
+        let mut stream = image_stream(false, false);
+        stream.dict.set("DecodeParms", value);
+        assert!(LopdfExtractor::native_image_metadata(&doc, (100, 0), &stream).is_err());
+    }
+
+    #[test]
+    fn native_decode_unsupported_metadata_and_ccitt_fail_closed() {
+        for (key, value) in [
+            ("Mask", Object::Array(vec![0.into(), 10.into()])),
+            ("SMask", Object::Reference((900, 0))),
+            ("ImageMask", Object::Boolean(true)),
+            ("Decode", Object::Array(vec![1.into(), 0.into()])),
+            (
+                "DecodeParms",
+                Object::Dictionary(dictionary! { "Predictor" => 12, "Columns" => 2 }),
+            ),
+            (
+                "Filter",
+                Object::Array(vec!["ASCII85Decode".into(), "FlateDecode".into()]),
+            ),
+            ("Filter", Object::Name(b"CCITTFaxDecode".to_vec())),
+        ] {
+            let mut stream = image_stream(false, false);
+            stream.dict.set(key, value);
+            let (mut doc, _) = fixture(stream, vec![content(b"/Scan Do")]);
+            let (_dir, native) = load(&mut doc);
+            let meta = &native.pages()[0].image_invocations[0].metadata;
+            assert_eq!(
+                meta.transform_decode,
+                NativeTransformDecodeCapability::Unsupported,
+                "{key}"
+            );
+            assert!(native.pages()[0].review_required);
+            assert!(native.decode_image(meta, 1024).is_err());
+        }
+    }
+
+    #[test]
+    fn native_content_strict_read_keeps_malformed_and_inline_pages() {
+        let corrupt = Object::Stream(Stream::new(
+            dictionary! { "Filter" => "FlateDecode" },
+            b"not zlib".to_vec(),
+        ));
+        let (mut doc, _) = fixture(
+            image_stream(false, false),
+            vec![
+                content(b"/Scan Do"),
+                Object::Reference((999, 0)),
+                Object::Integer(7),
+                corrupt,
+                content(b"BI /W 1 /H 1 /CS /G /BPC 8 ID x EI"),
+                content(b"/Scan Do /Scan Do"),
+                content(b"/Scan Do 0 0 1 1 re f"),
+            ],
+        );
+        let (_dir, native) = load(&mut doc);
+        assert_eq!(native.pages().len(), 7);
+        assert!(!native.pages()[0].review_required);
+        assert!(native.pages()[1..].iter().all(|p| p.review_required));
+        for page in &native.pages()[1..5] {
+            assert_eq!(page.kind, NativePageKind::UnsupportedContent);
+        }
+    }
+
+    #[test]
+    fn native_content_arrays_concatenate_without_invented_separator() {
+        let (mut doc, _) = fixture(image_stream(false, false), vec![Object::Null]);
+        let a = doc.add_object(Stream::new(dictionary! {}, b"2 0 0 3 5 7 cm /Sc".to_vec()));
+        let b = doc.add_object(Stream::new(
+            dictionary! { "Filter" => "FlateDecode" },
+            flate(b"an Do"),
+        ));
+        let page_id = *doc.get_pages().values().next().unwrap();
+        doc.get_object_mut(page_id)
+            .unwrap()
+            .as_dict_mut()
+            .unwrap()
+            .set("Contents", vec![Object::Reference(a), Object::Reference(b)]);
+        let (_dir, native) = load(&mut doc);
+        assert_eq!(native.pages()[0].kind, NativePageKind::SingleImage);
+        assert_eq!(
+            native.pages()[0].image_invocations[0]
+                .binding
+                .placement_matrix
+                .coordinates(),
+            [2., 0., 0., 3., 5., 7.]
+        );
+    }
+
+    #[test]
+    fn native_content_cycles_and_unsafe_graphics_require_review() {
+        let (mut doc, _) = fixture(
+            image_stream(false, false),
+            vec![
+                content(b"/GS gs /Scan Do"),
+                content(b"0 0 1 1 re W n /Scan Do"),
+                content(b"7 Tr /Scan Do"),
+                content(b"/OC /Layer BDC /Scan Do EMC"),
+                content(b"/Scan Do /Bad w"),
+                content(b"/Scan Do BT"),
+                content(b"/Scan Do ET"),
+                content(b"/Scan Do 1 BT ET"),
+                content(b"BT /Scan Do ET"),
+                content(b"/Scan Do BT BT ET ET"),
+                Object::Null,
+            ],
+        );
+        let cycle = doc.new_object_id();
+        doc.objects
+            .insert(cycle, Object::Array(vec![Object::Reference(cycle)]));
+        let last = *doc.get_pages().values().last().unwrap();
+        doc.get_object_mut(last)
+            .unwrap()
+            .as_dict_mut()
+            .unwrap()
+            .set("Contents", Object::Reference(cycle));
+        let expected_pages = doc.get_pages().len();
+        let (_dir, native) = load(&mut doc);
+        assert_eq!(native.pages().len(), expected_pages);
+        assert!(native.pages().iter().all(|p| p.review_required));
+    }
+
+    #[test]
+    fn native_page_annotations_and_units_require_review() {
+        for (key, value) in [
+            ("Annots", Object::Array(Vec::new())),
+            ("UserUnit", Object::Integer(2)),
+            ("Group", Object::Dictionary(dictionary! {})),
+        ] {
+            let (mut doc, _) = fixture(image_stream(false, false), vec![content(b"/Scan Do")]);
+            let page = *doc.get_pages().values().next().unwrap();
+            doc.get_object_mut(page)
+                .unwrap()
+                .as_dict_mut()
+                .unwrap()
+                .set(key, value);
+            let (_dir, native) = load(&mut doc);
+            assert!(native.pages()[0].review_required, "{key}");
+        }
+    }
+
+    #[test]
+    fn native_matrix_overflow_is_rejected_and_concat_order_is_pdf_order() {
+        let a = PdfMatrix::try_new([2., 0., 0., 3., 5., 7.]).unwrap();
+        let b = PdfMatrix::try_new([1., 0., 0., 1., 11., 13.]).unwrap();
+        assert_eq!(
+            a.pre_concat(b).unwrap().coordinates(),
+            [2., 0., 0., 3., 27., 46.]
+        );
+        let huge = PdfMatrix::try_new([f64::MAX, 0., 0., f64::MAX, 0., 0.]).unwrap();
+        assert!(huge.pre_concat(huge).is_err());
+    }
+}
 
 // ============================================================
 // Constants
@@ -76,6 +409,37 @@ pub enum ExtractError {
 
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
+}
+
+/// Preservation-only native extraction failures that cannot be scoped to one page.
+#[derive(Debug, Error)]
+pub enum NativeExtractError {
+    #[error(transparent)]
+    PdfReader(#[from] crate::pdf_reader::PdfReaderError),
+
+    #[error("encrypted PDFs are not supported by the preservation pipeline")]
+    EncryptedPdf,
+
+    #[error("native page inventory failed: {0}")]
+    Inventory(String),
+
+    #[error("native image object {0:?} is missing or not a stream")]
+    MissingImageObject(crate::transform_manifest::PdfObjectId),
+
+    #[error("native image object {0:?} no longer matches its inventory hash")]
+    ImageHashMismatch(crate::transform_manifest::PdfObjectId),
+
+    #[error("native image metadata no longer matches the source dictionary")]
+    ImageMetadataMismatch,
+
+    #[error("unsupported native image decode: {0}")]
+    UnsupportedDecode(String),
+
+    #[error("native image decode exceeds the encoded/decoded byte safety limit")]
+    DecodeLimit,
+
+    #[error("invalid native image data: {0}")]
+    ImageDecode(String),
 }
 
 pub type Result<T> = std::result::Result<T, ExtractError>;
@@ -263,6 +627,396 @@ pub struct ExtractedPage {
     pub width: u32,
     pub height: u32,
     pub format: ImageFormat,
+}
+
+/// Conservative classification of one physical PDF page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativePageKind {
+    Blank,
+    SingleImage,
+    MultipleImages,
+    CompositeContent,
+    NonImageContent,
+    UnsupportedContent,
+}
+
+/// Stable page-scoped native inventory issue codes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativePageIssueCode {
+    PhysicalPage(crate::pdf_reader::PhysicalPageIssue),
+    ContentRead,
+    ContentDecode,
+    InvalidResources,
+    InlineImage,
+    UnbalancedGraphicsState,
+    InvalidMatrix,
+    UnsupportedOperator,
+    InvalidDo,
+    UnresolvedXObject,
+    XObjectNotStream,
+    InvalidXObjectSubtype,
+    InvalidImageMetadata,
+    FormCycle,
+    FormDepthExceeded,
+    InvalidFormResources,
+    FormDecode,
+    InvalidFormMatrix,
+}
+
+impl NativePageIssueCode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PhysicalPage(issue) => issue.as_str(),
+            Self::ContentRead => "content_read",
+            Self::ContentDecode => "content_decode",
+            Self::InvalidResources => "invalid_resources",
+            Self::InlineImage => "inline_image",
+            Self::UnbalancedGraphicsState => "unbalanced_graphics_state",
+            Self::InvalidMatrix => "invalid_matrix",
+            Self::UnsupportedOperator => "unsupported_operator",
+            Self::InvalidDo => "invalid_do",
+            Self::UnresolvedXObject => "unresolved_xobject",
+            Self::XObjectNotStream => "xobject_not_stream",
+            Self::InvalidXObjectSubtype => "invalid_xobject_subtype",
+            Self::InvalidImageMetadata => "invalid_image_metadata",
+            Self::FormCycle => "form_cycle",
+            Self::FormDepthExceeded => "form_depth_exceeded",
+            Self::InvalidFormResources => "invalid_form_resources",
+            Self::FormDecode => "form_decode",
+            Self::InvalidFormMatrix => "invalid_form_matrix",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativePageIssue {
+    pub code: NativePageIssueCode,
+    pub detail: String,
+}
+
+impl NativePageIssue {
+    fn new(code: NativePageIssueCode, detail: impl Into<String>) -> Self {
+        Self {
+            code,
+            detail: detail.into(),
+        }
+    }
+}
+
+/// PDF affine matrix `[a b c d e f]` using the PDF coordinate convention.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PdfMatrix([f64; 6]);
+
+impl PdfMatrix {
+    pub const IDENTITY: Self = Self([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+
+    fn try_new(values: [f64; 6]) -> std::result::Result<Self, ()> {
+        values
+            .iter()
+            .all(|value| value.is_finite())
+            .then_some(Self(values))
+            .ok_or(())
+    }
+
+    /// Pre-concatenate `next`, matching the PDF `cm` operator.
+    fn pre_concat(self, next: Self) -> std::result::Result<Self, ()> {
+        let [a, b, c, d, e, f] = self.0;
+        let [g, h, i, j, k, l] = next.0;
+        Self::try_new([
+            a * g + c * h,
+            b * g + d * h,
+            a * i + c * j,
+            b * i + d * j,
+            a * k + c * l + e,
+            b * k + d * l + f,
+        ])
+    }
+
+    #[must_use]
+    pub const fn coordinates(self) -> [f64; 6] {
+        self.0
+    }
+}
+
+/// One named XObject lookup along the page-to-image resource path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeResourcePathStep {
+    pub owner_object_id: crate::transform_manifest::PdfObjectId,
+    pub resource_name: Vec<u8>,
+}
+
+/// Writer handoff data for one actual image invocation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NativeImageBinding {
+    pub resource_path: Vec<NativeResourcePathStep>,
+    pub placement_matrix: PdfMatrix,
+    pub is_direct: bool,
+}
+
+/// Whether the currently supported native path can decode this image for geometry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeTransformDecodeCapability {
+    Dct8,
+    Flate8,
+    Unsupported,
+}
+
+/// A native metadata shape that cannot be represented losslessly in manifest schema v1.
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum ManifestV1ProjectionError {
+    #[error("manifest schema v1 cannot represent a PDF filter chain")]
+    FilterChainNotRepresentable,
+    #[error("manifest schema v1 cannot represent a complex PDF color space")]
+    ColorSpaceNotRepresentable,
+}
+
+/// Native metadata for one image invocation discovered in page content.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NativeImageMetadata {
+    pub object_id: crate::transform_manifest::PdfObjectId,
+    pub width: u32,
+    pub height: u32,
+    pub color_space: Option<serde_json::Value>,
+    pub bits_per_component: Option<u8>,
+    pub filters: Vec<String>,
+    pub decode_params: Option<serde_json::Value>,
+    pub encoded_length: usize,
+    pub encoded_sha256: String,
+    pub transform_decode: NativeTransformDecodeCapability,
+}
+
+impl NativeImageMetadata {
+    pub fn to_manifest_v1(
+        &self,
+    ) -> std::result::Result<
+        crate::transform_manifest::SourceImageMetadata,
+        ManifestV1ProjectionError,
+    > {
+        let filter = match self.filters.as_slice() {
+            [] => None,
+            [filter] => Some(filter.clone()),
+            _ => return Err(ManifestV1ProjectionError::FilterChainNotRepresentable),
+        };
+        let color_space = match self.color_space.as_ref() {
+            None => None,
+            Some(serde_json::Value::String(value)) if value.starts_with('/') => Some(value.clone()),
+            Some(_) => return Err(ManifestV1ProjectionError::ColorSpaceNotRepresentable),
+        };
+        Ok(crate::transform_manifest::SourceImageMetadata {
+            object_id: Some(self.object_id.clone()),
+            width: self.width,
+            height: self.height,
+            color_space,
+            bits_per_component: self.bits_per_component,
+            filter,
+            decode_params: self.decode_params.clone(),
+        })
+    }
+}
+
+/// Native image metadata plus the content/resource binding that painted it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NativeImageInvocation {
+    pub metadata: NativeImageMetadata,
+    pub binding: NativeImageBinding,
+}
+
+/// Preservation inventory record for one physical page-tree entry.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NativePageRecord {
+    pub physical_page: crate::pdf_reader::PhysicalPageMetadata,
+    pub kind: NativePageKind,
+    pub image_invocations: Vec<NativeImageInvocation>,
+    pub review_required: bool,
+    pub issues: Vec<NativePageIssue>,
+}
+
+#[derive(Debug, Clone)]
+struct NativeResourceContext {
+    owner_object_id: crate::transform_manifest::PdfObjectId,
+    dictionary: lopdf::Dictionary,
+}
+
+/// Shared page traversal budget, including repeatedly invoked Forms.
+struct NativeWalkState<'a> {
+    image_invocations: &'a mut Vec<NativeImageInvocation>,
+    issues: &'a mut Vec<NativePageIssue>,
+    active_forms: &'a mut HashSet<lopdf::ObjectId>,
+    has_non_image_paint: &'a mut bool,
+    remaining_bytes: &'a mut usize,
+    remaining_operations: &'a mut usize,
+}
+
+const NATIVE_CONTENT_LIMIT: usize = 8 * 1024 * 1024;
+const NATIVE_IMAGE_LIMIT: u64 = 256 * 1024 * 1024;
+
+/// Loaded source PDF plus its page-complete preservation inventory.
+pub struct NativePdfDocument {
+    reader: crate::pdf_reader::LopdfReader,
+    pages: Vec<NativePageRecord>,
+}
+
+impl NativePdfDocument {
+    /// Decode verified native samples without rendering, resizing, EXIF rotation,
+    /// recompression, or post-decode color conversion. DCT is already lossy: this
+    /// preserves the decoder's Gray8/RGB8 samples, not pre-JPEG originals.
+    ///
+    /// `max_decoded_bytes` bounds output samples (also hard-capped at 256 MiB).
+    /// Encoded data is separately capped at 256 MiB. Codec working memory is not
+    /// included in this sample budget. Unsupported PDF semantics fail closed.
+    pub fn decode_image(
+        &self,
+        metadata: &NativeImageMetadata,
+        max_decoded_bytes: u64,
+    ) -> std::result::Result<image::DynamicImage, NativeExtractError> {
+        use image::ImageDecoder;
+        let bytes = self.encoded_image_bytes(metadata)?;
+        if bytes.len() as u64 > NATIVE_IMAGE_LIMIT {
+            return Err(NativeExtractError::DecodeLimit);
+        }
+        let id = (
+            metadata.object_id.object_number,
+            metadata.object_id.generation,
+        );
+        let stream = self
+            .reader
+            .document()
+            .get_object(id)
+            .and_then(lopdf::Object::as_stream)
+            .map_err(|_| NativeExtractError::MissingImageObject(metadata.object_id.clone()))?;
+        let actual = LopdfExtractor::native_image_metadata(self.reader.document(), id, stream)
+            .map_err(NativeExtractError::ImageDecode)?;
+        if &actual != metadata {
+            return Err(NativeExtractError::ImageMetadataMismatch);
+        }
+        if actual.transform_decode == NativeTransformDecodeCapability::Unsupported {
+            return Err(NativeExtractError::UnsupportedDecode(format!(
+                "filters {:?}, bit depth {:?}, or PDF image semantics (CCITT is not implemented)",
+                actual.filters, actual.bits_per_component
+            )));
+        }
+        let rgb = actual.color_space.as_ref() == Some(&serde_json::json!("/DeviceRGB"));
+        let color = if rgb {
+            image::ColorType::Rgb8
+        } else {
+            image::ColorType::L8
+        };
+        let expected = u64::from(actual.width)
+            .checked_mul(u64::from(actual.height))
+            .and_then(|n| n.checked_mul(if rgb { 3 } else { 1 }))
+            .filter(|n| *n <= max_decoded_bytes.min(NATIVE_IMAGE_LIMIT))
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or(NativeExtractError::DecodeLimit)?;
+        let samples = match actual.transform_decode {
+            NativeTransformDecodeCapability::Flate8 => {
+                LopdfExtractor::inflate_bounded(bytes, expected)
+                    .map_err(NativeExtractError::ImageDecode)?
+            }
+            NativeTransformDecodeCapability::Dct8 => {
+                LopdfExtractor::verify_jpeg_header(bytes, actual.width, actual.height, rgb)
+                    .map_err(NativeExtractError::ImageDecode)?;
+                let mut decoder =
+                    image::codecs::jpeg::JpegDecoder::new(std::io::Cursor::new(bytes))
+                        .map_err(|e| NativeExtractError::ImageDecode(e.to_string()))?;
+                if decoder.dimensions() != (actual.width, actual.height)
+                    || decoder.color_type() != color
+                    || decoder.total_bytes() != expected as u64
+                {
+                    return Err(NativeExtractError::ImageDecode(
+                        "JPEG dimensions/color disagree with PDF".into(),
+                    ));
+                }
+                let mut limits = image::Limits::default();
+                limits.max_image_width = Some(actual.width);
+                limits.max_image_height = Some(actual.height);
+                limits.max_alloc = Some(max_decoded_bytes.min(NATIVE_IMAGE_LIMIT));
+                decoder
+                    .set_limits(limits)
+                    .map_err(|e| NativeExtractError::ImageDecode(e.to_string()))?;
+                let mut pixels = vec![0; expected];
+                decoder
+                    .read_image(&mut pixels)
+                    .map_err(|e| NativeExtractError::ImageDecode(e.to_string()))?;
+                pixels
+            }
+            NativeTransformDecodeCapability::Unsupported => unreachable!("checked above"),
+        };
+        if samples.len() != expected {
+            return Err(NativeExtractError::ImageDecode(
+                "decoded sample length disagrees with PDF dimensions".into(),
+            ));
+        }
+        if rgb {
+            image::RgbImage::from_raw(actual.width, actual.height, samples)
+                .map(image::DynamicImage::ImageRgb8)
+        } else {
+            image::GrayImage::from_raw(actual.width, actual.height, samples)
+                .map(image::DynamicImage::ImageLuma8)
+        }
+        .ok_or_else(|| NativeExtractError::ImageDecode("invalid sample layout".into()))
+    }
+
+    #[must_use]
+    pub fn pages(&self) -> &[NativePageRecord] {
+        &self.pages
+    }
+
+    #[must_use]
+    pub fn source_path(&self) -> &Path {
+        &self.reader.info.path
+    }
+
+    pub fn encoded_image_bytes<'a>(
+        &'a self,
+        metadata: &NativeImageMetadata,
+    ) -> std::result::Result<&'a [u8], NativeExtractError> {
+        let object_id = (
+            metadata.object_id.object_number,
+            metadata.object_id.generation,
+        );
+        let stream = self
+            .reader
+            .document()
+            .get_object(object_id)
+            .and_then(lopdf::Object::as_stream)
+            .map_err(|_| NativeExtractError::MissingImageObject(metadata.object_id.clone()))?;
+        let actual_hash = format!("{:x}", Sha256::digest(&stream.content));
+        if stream.content.len() != metadata.encoded_length || actual_hash != metadata.encoded_sha256
+        {
+            return Err(NativeExtractError::ImageHashMismatch(
+                metadata.object_id.clone(),
+            ));
+        }
+        Ok(&stream.content)
+    }
+
+    /// Task 6 writer input; intentionally crate-private to avoid exposing lopdf publicly.
+    #[allow(dead_code)]
+    pub(crate) fn source_document(&self) -> &lopdf::Document {
+        self.reader.document()
+    }
+}
+
+/// DPI-free native preservation extractor.
+pub struct NativePdfExtractor;
+
+impl NativePdfExtractor {
+    pub fn extract_path(path: &Path) -> std::result::Result<NativePdfDocument, NativeExtractError> {
+        let reader = crate::pdf_reader::LopdfReader::new_native(path)?;
+        if reader.info.is_encrypted {
+            return Err(NativeExtractError::EncryptedPdf);
+        }
+        let pages = reader
+            .physical_pages()
+            .iter()
+            .cloned()
+            .map(|physical_page| {
+                LopdfExtractor::inspect_native_page(reader.document(), physical_page)
+            })
+            .collect();
+        Ok(NativePdfDocument { reader, pages })
+    }
 }
 
 /// Image extractor trait
@@ -499,6 +1253,1046 @@ impl MagickExtractor {
 pub struct LopdfExtractor;
 
 impl LopdfExtractor {
+    /// Inspect native page/image objects without rendering or DPI conversion.
+    pub fn inspect_native_pages(pdf_path: &Path) -> Result<Vec<NativePageRecord>> {
+        NativePdfExtractor::extract_path(pdf_path)
+            .map(|document| document.pages)
+            .map_err(|error| match error {
+                NativeExtractError::PdfReader(crate::pdf_reader::PdfReaderError::FileNotFound(
+                    path,
+                )) => ExtractError::PdfNotFound(path),
+                other => ExtractError::ExtractionFailed {
+                    page: 0,
+                    reason: other.to_string(),
+                },
+            })
+    }
+
+    fn inspect_native_page(
+        doc: &lopdf::Document,
+        physical_page: crate::pdf_reader::PhysicalPageMetadata,
+    ) -> NativePageRecord {
+        let page_id = (
+            physical_page.page_object_id.object_number,
+            physical_page.page_object_id.generation,
+        );
+        let mut issues: Vec<NativePageIssue> = physical_page
+            .issues
+            .iter()
+            .map(|issue| {
+                NativePageIssue::new(NativePageIssueCode::PhysicalPage(*issue), issue.as_str())
+            })
+            .collect();
+        if let Ok(page) = doc.get_dictionary(page_id) {
+            for key in [
+                b"Annots".as_slice(),
+                b"UserUnit",
+                b"Group",
+                b"VP",
+                b"PresSteps",
+            ] {
+                if page.has(key) {
+                    issues.push(NativePageIssue::new(
+                        NativePageIssueCode::UnsupportedOperator,
+                        format!(
+                            "page /{} semantics require review",
+                            Self::canonical_pdf_name(key)
+                        ),
+                    ));
+                }
+            }
+        }
+        let content = match Self::strict_page_content(doc, page_id) {
+            Ok(content) => content,
+            Err(error) => {
+                issues.push(NativePageIssue::new(
+                    NativePageIssueCode::ContentRead,
+                    format!("cannot read page content: {error}"),
+                ));
+                Vec::new()
+            }
+        };
+        let mut image_invocations = Vec::new();
+        let mut has_non_image_paint = false;
+        if !content.is_empty() {
+            match Self::page_resources(doc, page_id) {
+                Ok(resources) => {
+                    let mut active_forms = HashSet::new();
+                    Self::walk_content_images(
+                        doc,
+                        &content,
+                        resources.as_ref(),
+                        NativeWalkState {
+                            image_invocations: &mut image_invocations,
+                            issues: &mut issues,
+                            active_forms: &mut active_forms,
+                            has_non_image_paint: &mut has_non_image_paint,
+                            remaining_bytes: &mut NATIVE_CONTENT_LIMIT.clone(),
+                            remaining_operations: &mut 100_000,
+                        },
+                        0,
+                        PdfMatrix::IDENTITY,
+                        &[],
+                    );
+                }
+                Err(error) => issues.push(NativePageIssue::new(
+                    NativePageIssueCode::InvalidResources,
+                    error,
+                )),
+            }
+        }
+
+        let kind = if !issues.is_empty() {
+            NativePageKind::UnsupportedContent
+        } else if content.is_empty() {
+            NativePageKind::Blank
+        } else {
+            match image_invocations.len() {
+                0 => NativePageKind::NonImageContent,
+                1 if has_non_image_paint => NativePageKind::CompositeContent,
+                1 => NativePageKind::SingleImage,
+                _ => NativePageKind::MultipleImages,
+            }
+        };
+        let review_required = !matches!(kind, NativePageKind::Blank | NativePageKind::SingleImage)
+            || image_invocations.iter().any(|image| {
+                image.metadata.transform_decode == NativeTransformDecodeCapability::Unsupported
+            });
+
+        NativePageRecord {
+            physical_page,
+            kind,
+            image_invocations,
+            review_required,
+            issues,
+        }
+    }
+
+    fn walk_content_images(
+        doc: &lopdf::Document,
+        bytes: &[u8],
+        resources: Option<&NativeResourceContext>,
+        state: NativeWalkState<'_>,
+        depth: usize,
+        initial_matrix: PdfMatrix,
+        resource_path: &[NativeResourcePathStep],
+    ) {
+        let NativeWalkState {
+            image_invocations,
+            issues,
+            active_forms,
+            has_non_image_paint,
+            remaining_bytes,
+            remaining_operations,
+        } = state;
+        if bytes.len() > *remaining_bytes {
+            issues.push(NativePageIssue::new(
+                NativePageIssueCode::ContentRead,
+                "page/Form content byte budget exhausted",
+            ));
+            return;
+        }
+        *remaining_bytes -= bytes.len();
+        const MAX_FORM_DEPTH: usize = 32;
+        if depth >= MAX_FORM_DEPTH {
+            issues.push(NativePageIssue::new(
+                NativePageIssueCode::FormDepthExceeded,
+                "Form XObject nesting reaches the 32-level safety limit",
+            ));
+            return;
+        }
+        let content = match Self::strict_content_decode(bytes) {
+            Ok(content) => content,
+            Err(error) => {
+                issues.push(NativePageIssue::new(
+                    NativePageIssueCode::ContentDecode,
+                    format!("cannot decode page content: {error}"),
+                ));
+                return;
+            }
+        };
+        let xobjects = Self::xobject_map(doc, resources.map(|value| &value.dictionary));
+        let mut current_matrix = initial_matrix;
+        let mut graphics_stack = Vec::new();
+        let mut in_text = false;
+        for operation in content.operations {
+            if *remaining_operations == 0 {
+                issues.push(NativePageIssue::new(
+                    NativePageIssueCode::ContentDecode,
+                    "page/Form operation budget exhausted",
+                ));
+                return;
+            }
+            *remaining_operations -= 1;
+            if matches!(operation.operator.as_str(), "q" | "Q") && !operation.operands.is_empty() {
+                issues.push(NativePageIssue::new(
+                    NativePageIssueCode::UnbalancedGraphicsState,
+                    "q/Q must have no operands",
+                ));
+                continue;
+            }
+            match operation.operator.as_str() {
+                "q" => {
+                    graphics_stack.push(current_matrix);
+                    continue;
+                }
+                "Q" => {
+                    let Some(previous) = graphics_stack.pop() else {
+                        issues.push(NativePageIssue::new(
+                            NativePageIssueCode::UnbalancedGraphicsState,
+                            "unbalanced graphics-state restore",
+                        ));
+                        continue;
+                    };
+                    current_matrix = previous;
+                    continue;
+                }
+                "cm" => {
+                    let Some(matrix) = Self::matrix_from_operands(doc, &operation.operands) else {
+                        issues.push(NativePageIssue::new(
+                            NativePageIssueCode::InvalidMatrix,
+                            "cm operation has an invalid affine matrix",
+                        ));
+                        continue;
+                    };
+                    match current_matrix.pre_concat(matrix) {
+                        Ok(matrix) => current_matrix = matrix,
+                        Err(()) => {
+                            issues.push(NativePageIssue::new(
+                                NativePageIssueCode::InvalidMatrix,
+                                "cm matrix concatenation overflow",
+                            ));
+                            return;
+                        }
+                    }
+                    continue;
+                }
+                "BI" | "ID" | "EI" => {
+                    issues.push(NativePageIssue::new(
+                        NativePageIssueCode::InlineImage,
+                        "inline images are unsupported in native preservation mode",
+                    ));
+                    continue;
+                }
+                "BT" | "ET" => {
+                    let begin = operation.operator == "BT";
+                    if !operation.operands.is_empty() || begin == in_text {
+                        issues.push(NativePageIssue::new(
+                            NativePageIssueCode::UnsupportedOperator,
+                            "invalid or unbalanced text-object boundary",
+                        ));
+                    }
+                    in_text = begin;
+                    continue;
+                }
+                "Do" => {
+                    if in_text {
+                        issues.push(NativePageIssue::new(
+                            NativePageIssueCode::UnsupportedOperator,
+                            "XObject invocation within a text object",
+                        ));
+                    }
+                }
+                operator if Self::is_non_image_paint_operator(operator) => {
+                    *has_non_image_paint = true;
+                    continue;
+                }
+                operator if Self::is_known_nonpainting_operator(operator) => {
+                    issues.push(NativePageIssue::new(
+                        NativePageIssueCode::UnsupportedOperator,
+                        format!("unmodeled operator {operator} requires review"),
+                    ));
+                    continue;
+                }
+                operator => {
+                    issues.push(NativePageIssue::new(
+                        NativePageIssueCode::UnsupportedOperator,
+                        format!("unsupported PDF content operator {operator}"),
+                    ));
+                    continue;
+                }
+            }
+
+            if operation.operands.len() != 1 {
+                issues.push(NativePageIssue::new(
+                    NativePageIssueCode::InvalidDo,
+                    "Do must have exactly one operand",
+                ));
+                continue;
+            }
+            let Some(name) = operation
+                .operands
+                .first()
+                .and_then(|operand| operand.as_name().ok())
+            else {
+                issues.push(NativePageIssue::new(
+                    NativePageIssueCode::InvalidDo,
+                    "Do operation has no valid XObject name",
+                ));
+                continue;
+            };
+            let Some(object_id) = xobjects.get(name) else {
+                issues.push(NativePageIssue::new(
+                    NativePageIssueCode::UnresolvedXObject,
+                    format!("unresolved XObject name /{}", String::from_utf8_lossy(name)),
+                ));
+                continue;
+            };
+            let Ok(stream) = doc
+                .get_object(*object_id)
+                .and_then(lopdf::Object::as_stream)
+            else {
+                issues.push(NativePageIssue::new(
+                    NativePageIssueCode::XObjectNotStream,
+                    format!("XObject {:?} is not an indirect stream", object_id),
+                ));
+                continue;
+            };
+            let mut nested_path = resource_path.to_vec();
+            nested_path.push(NativeResourcePathStep {
+                owner_object_id: resources.map_or_else(
+                    || Self::pdf_object_id(*object_id),
+                    |value| value.owner_object_id.clone(),
+                ),
+                resource_name: name.to_vec(),
+            });
+            match stream
+                .dict
+                .get(b"Subtype")
+                .ok()
+                .and_then(|value| value.as_name_str().ok())
+            {
+                Some("Image") => match Self::native_image_metadata(doc, *object_id, stream) {
+                    Ok(metadata) => image_invocations.push(NativeImageInvocation {
+                        metadata,
+                        binding: NativeImageBinding {
+                            is_direct: nested_path.len() == 1,
+                            resource_path: nested_path,
+                            placement_matrix: current_matrix,
+                        },
+                    }),
+                    Err(error) => issues.push(NativePageIssue::new(
+                        NativePageIssueCode::InvalidImageMetadata,
+                        error,
+                    )),
+                },
+                Some("Form") => {
+                    if !active_forms.insert(*object_id) {
+                        issues.push(NativePageIssue::new(
+                            NativePageIssueCode::FormCycle,
+                            format!("recursive Form XObject at {:?}", object_id),
+                        ));
+                        continue;
+                    }
+                    let nested_resources = match stream.dict.get(b"Resources") {
+                        Ok(value) => match Self::dictionary_value(doc, Some(value)) {
+                            Some(dictionary) => Some(NativeResourceContext {
+                                owner_object_id: Self::pdf_object_id(*object_id),
+                                dictionary: dictionary.clone(),
+                            }),
+                            None => {
+                                issues.push(NativePageIssue::new(
+                                    NativePageIssueCode::InvalidFormResources,
+                                    format!("Form XObject {:?} has invalid Resources", object_id),
+                                ));
+                                None
+                            }
+                        },
+                        Err(_) => resources.cloned(),
+                    };
+                    let form_matrix = match stream.dict.get(b"Matrix") {
+                        Ok(value) => match Self::matrix_from_object(doc, value) {
+                            Some(matrix) => matrix,
+                            None => {
+                                issues.push(NativePageIssue::new(
+                                    NativePageIssueCode::InvalidFormMatrix,
+                                    format!("Form XObject {:?} has an invalid Matrix", object_id),
+                                ));
+                                active_forms.remove(object_id);
+                                continue;
+                            }
+                        },
+                        Err(_) => PdfMatrix::IDENTITY,
+                    };
+                    // Form BBox clipping and transparency groups are not modeled.
+                    // Keep inventory/path information, but never approve this page.
+                    issues.push(NativePageIssue::new(
+                        NativePageIssueCode::UnsupportedOperator,
+                        "Form BBox clipping/group semantics require review",
+                    ));
+                    let nested_content =
+                        match Self::strict_stream_content(doc, stream, *remaining_bytes) {
+                            Ok(content) => content,
+                            Err(error) => {
+                                issues.push(NativePageIssue::new(
+                                    NativePageIssueCode::FormDecode,
+                                    error,
+                                ));
+                                active_forms.remove(object_id);
+                                continue;
+                            }
+                        };
+                    let Ok(nested_matrix) = current_matrix.pre_concat(form_matrix) else {
+                        issues.push(NativePageIssue::new(
+                            NativePageIssueCode::InvalidFormMatrix,
+                            "Form matrix concatenation overflow",
+                        ));
+                        active_forms.remove(object_id);
+                        continue;
+                    };
+                    Self::walk_content_images(
+                        doc,
+                        &nested_content,
+                        nested_resources.as_ref(),
+                        NativeWalkState {
+                            image_invocations,
+                            issues,
+                            active_forms,
+                            has_non_image_paint,
+                            remaining_bytes,
+                            remaining_operations,
+                        },
+                        depth + 1,
+                        nested_matrix,
+                        &nested_path,
+                    );
+                    active_forms.remove(object_id);
+                }
+                Some(other) => issues.push(NativePageIssue::new(
+                    NativePageIssueCode::InvalidXObjectSubtype,
+                    format!("unsupported XObject subtype {other}"),
+                )),
+                None => issues.push(NativePageIssue::new(
+                    NativePageIssueCode::InvalidXObjectSubtype,
+                    "XObject has no valid Subtype",
+                )),
+            }
+        }
+        if in_text {
+            issues.push(NativePageIssue::new(
+                NativePageIssueCode::UnsupportedOperator,
+                "unterminated text object",
+            ));
+        }
+        if !graphics_stack.is_empty() {
+            issues.push(NativePageIssue::new(
+                NativePageIssueCode::UnbalancedGraphicsState,
+                "unbalanced graphics-state save",
+            ));
+        }
+    }
+
+    fn is_non_image_paint_operator(operator: &str) -> bool {
+        matches!(
+            operator,
+            "S" | "s"
+                | "f"
+                | "F"
+                | "f*"
+                | "B"
+                | "B*"
+                | "b"
+                | "b*"
+                | "sh"
+                | "Tj"
+                | "TJ"
+                | "'"
+                | "\""
+        )
+    }
+
+    fn is_known_nonpainting_operator(operator: &str) -> bool {
+        matches!(
+            operator,
+            "w" | "J"
+                | "j"
+                | "M"
+                | "d"
+                | "i"
+                | "m"
+                | "l"
+                | "c"
+                | "v"
+                | "y"
+                | "h"
+                | "re"
+                | "n"
+                | "G"
+                | "g"
+                | "RG"
+                | "rg"
+                | "K"
+                | "k"
+                | "CS"
+                | "cs"
+                | "SC"
+                | "SCN"
+                | "sc"
+                | "scn"
+                | "BT"
+                | "ET"
+                | "Tc"
+                | "Tw"
+                | "Tz"
+                | "TL"
+                | "Tf"
+                | "Ts"
+                | "Td"
+                | "TD"
+                | "Tm"
+                | "T*"
+                | "MP"
+                | "DP"
+        )
+    }
+
+    fn matrix_from_operands(doc: &lopdf::Document, values: &[lopdf::Object]) -> Option<PdfMatrix> {
+        if values.len() != 6 {
+            return None;
+        }
+        let mut matrix = [0.0; 6];
+        for (destination, source) in matrix.iter_mut().zip(values) {
+            *destination = Self::pdf_number(doc, source)?;
+        }
+        PdfMatrix::try_new(matrix).ok()
+    }
+
+    fn matrix_from_object(doc: &lopdf::Document, value: &lopdf::Object) -> Option<PdfMatrix> {
+        let value = Self::resolve_object(doc, value).ok()?;
+        Self::matrix_from_operands(doc, value.as_array().ok()?)
+    }
+
+    fn pdf_number(doc: &lopdf::Document, value: &lopdf::Object) -> Option<f64> {
+        match Self::resolve_object(doc, value).ok()? {
+            lopdf::Object::Integer(value) => Some(*value as f64),
+            lopdf::Object::Real(value) => Some(f64::from(*value)),
+            _ => None,
+        }
+    }
+
+    fn page_resources(
+        doc: &lopdf::Document,
+        page_id: lopdf::ObjectId,
+    ) -> std::result::Result<Option<NativeResourceContext>, String> {
+        let (value, defined_on) =
+            match crate::pdf_reader::LopdfReader::inherited_page_object(doc, page_id, b"Resources")
+            {
+                Ok(Some(value)) => value,
+                Ok(None) => return Ok(None),
+                Err(()) => return Err("cycle or invalid object in page Parent chain".to_string()),
+            };
+        Self::dictionary_value(doc, Some(&value))
+            .cloned()
+            .map(|dictionary| {
+                Some(NativeResourceContext {
+                    owner_object_id: Self::pdf_object_id(defined_on),
+                    dictionary,
+                })
+            })
+            .ok_or_else(|| "invalid Resources dictionary".to_string())
+    }
+
+    fn xobject_map(
+        doc: &lopdf::Document,
+        resources: Option<&lopdf::Dictionary>,
+    ) -> BTreeMap<Vec<u8>, lopdf::ObjectId> {
+        let Some(resources) = resources else {
+            return BTreeMap::new();
+        };
+        let Some(xobjects) = Self::dictionary_value(doc, resources.get(b"XObject").ok()) else {
+            return BTreeMap::new();
+        };
+        xobjects
+            .iter()
+            .filter_map(|(name, object)| object.as_reference().ok().map(|id| (name.clone(), id)))
+            .collect()
+    }
+
+    fn dictionary_value<'a>(
+        doc: &'a lopdf::Document,
+        value: Option<&'a lopdf::Object>,
+    ) -> Option<&'a lopdf::Dictionary> {
+        match value? {
+            lopdf::Object::Dictionary(dict) => Some(dict),
+            lopdf::Object::Reference(id) => doc.get_dictionary(*id).ok(),
+            _ => None,
+        }
+    }
+
+    fn resolve_object<'a>(
+        doc: &'a lopdf::Document,
+        value: &'a lopdf::Object,
+    ) -> std::result::Result<&'a lopdf::Object, lopdf::Error> {
+        let mut current = value;
+        let mut seen = HashSet::new();
+        while let lopdf::Object::Reference(id) = current {
+            if seen.len() >= 32 || !seen.insert(*id) {
+                return Err(lopdf::Error::Syntax(
+                    "cyclic or excessive native object reference".into(),
+                ));
+            }
+            current = doc.objects.get(id).ok_or(lopdf::Error::ObjectNotFound)?;
+        }
+        Ok(current)
+    }
+
+    /// Strict zlib: bounded output, checksum/end marker required, no trailing data.
+    fn inflate_bounded(bytes: &[u8], limit: usize) -> std::result::Result<Vec<u8>, String> {
+        let mut decoder = flate2::Decompress::new(true);
+        let mut result = Vec::new();
+        loop {
+            let before_in = decoder.total_in();
+            let before_out = decoder.total_out();
+            let mut chunk = [0_u8; 8192];
+            let available = (limit.saturating_sub(result.len()))
+                .saturating_add(1)
+                .min(chunk.len());
+            let status = decoder
+                .decompress(
+                    &bytes[before_in as usize..],
+                    &mut chunk[..available],
+                    flate2::FlushDecompress::None,
+                )
+                .map_err(|e| format!("invalid zlib stream: {e}"))?;
+            let produced = (decoder.total_out() - before_out) as usize;
+            if produced > limit.saturating_sub(result.len()) {
+                return Err("decoded byte limit exceeded".into());
+            }
+            result.extend_from_slice(&chunk[..produced]);
+            if status == flate2::Status::StreamEnd {
+                return if decoder.total_in() == bytes.len() as u64 {
+                    Ok(result)
+                } else {
+                    Err("trailing bytes after zlib stream".into())
+                };
+            }
+            if decoder.total_in() == before_in && decoder.total_out() == before_out {
+                return Err("truncated or stalled zlib stream".into());
+            }
+        }
+    }
+
+    fn strict_filters(
+        doc: &lopdf::Document,
+        dict: &lopdf::Dictionary,
+    ) -> std::result::Result<Vec<String>, String> {
+        let Ok(value) = dict.get(b"Filter") else {
+            return Ok(Vec::new());
+        };
+        let value = Self::resolve_object(doc, value).map_err(|e| e.to_string())?;
+        let name = |value: &lopdf::Object| -> std::result::Result<String, String> {
+            let value = Self::resolve_object(doc, value).map_err(|e| e.to_string())?;
+            value
+                .as_name()
+                .map(Self::canonical_pdf_name)
+                .map_err(|_| "Filter must contain PDF names".into())
+        };
+        match value {
+            lopdf::Object::Name(_) => Ok(vec![name(value)?]),
+            lopdf::Object::Array(values) if !values.is_empty() && values.len() <= 32 => {
+                values.iter().map(name).collect()
+            }
+            _ => Err("malformed Filter metadata".into()),
+        }
+    }
+
+    fn strict_stream_content(
+        doc: &lopdf::Document,
+        stream: &lopdf::Stream,
+        limit: usize,
+    ) -> std::result::Result<Vec<u8>, String> {
+        if stream.content.len() > NATIVE_CONTENT_LIMIT {
+            return Err("encoded content limit exceeded".into());
+        }
+        if [b"F".as_slice(), b"FFilter", b"FDecodeParms"]
+            .iter()
+            .any(|key| stream.dict.has(key))
+        {
+            return Err("external content streams are unsupported".into());
+        }
+        if let Ok(params) = stream.dict.get(b"DecodeParms") {
+            if !matches!(
+                Self::resolve_object(doc, params).map_err(|e| e.to_string())?,
+                lopdf::Object::Null
+            ) {
+                return Err("content DecodeParms are unsupported".into());
+            }
+        }
+        match Self::strict_filters(doc, &stream.dict)?.as_slice() {
+            [] if stream.content.len() <= limit => Ok(stream.content.clone()),
+            [filter] if filter == "FlateDecode" => Self::inflate_bounded(&stream.content, limit),
+            _ => Err("unsupported content filter or content limit exceeded".into()),
+        }
+    }
+
+    fn strict_page_content(
+        doc: &lopdf::Document,
+        id: lopdf::ObjectId,
+    ) -> std::result::Result<Vec<u8>, String> {
+        let page = doc.get_dictionary(id).map_err(|e| e.to_string())?;
+        let Ok(value) = page.get(b"Contents") else {
+            return Ok(Vec::new());
+        };
+        let value = Self::resolve_object(doc, value).map_err(|e| e.to_string())?;
+        let mut output = Vec::new();
+        let values = match value {
+            lopdf::Object::Null => return Ok(output),
+            lopdf::Object::Array(values) if values.len() <= 4096 => values.as_slice(),
+            lopdf::Object::Stream(_) => std::slice::from_ref(value),
+            _ => return Err("Contents must be a stream or a flat stream array".into()),
+        };
+        for value in values {
+            let stream = Self::resolve_object(doc, value)
+                .map_err(|e| e.to_string())?
+                .as_stream()
+                .map_err(|_| "Contents array entry is not a stream")?;
+            let bytes =
+                Self::strict_stream_content(doc, stream, NATIVE_CONTENT_LIMIT - output.len())?;
+            // PDF Contents arrays are one logical stream, not separate operations.
+            output.extend_from_slice(&bytes);
+        }
+        Ok(output)
+    }
+
+    fn strict_content_decode(
+        bytes: &[u8],
+    ) -> std::result::Result<lopdf::content::Content<Vec<lopdf::content::Operation>>, String> {
+        // lopdf's nom parser accepts a valid prefix and discards a malformed tail.
+        // A reserved final operator proves it consumed the complete bounded input.
+        const END: &str = "SuperbookNativeContentEnd";
+        if bytes.windows(END.len()).any(|w| w == END.as_bytes()) {
+            return Err("reserved content sentinel in input".into());
+        }
+        // Preflight nesting before calling the recursive operand parser. Ignore
+        // comments and escaped literal strings; a false rejection is review-only.
+        let mut nesting = 0_usize;
+        let mut literal = 0_usize;
+        let mut comment = false;
+        let mut escaped = false;
+        for &byte in bytes {
+            if comment {
+                comment = !matches!(byte, b'\r' | b'\n');
+                continue;
+            }
+            if literal > 0 {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                match byte {
+                    b'\\' => escaped = true,
+                    b'(' => literal += 1,
+                    b')' => literal -= 1,
+                    _ => {}
+                }
+            } else {
+                match byte {
+                    b'%' => comment = true,
+                    b'(' => literal = 1,
+                    b'[' | b'<' => nesting += 1,
+                    b']' | b'>' => nesting = nesting.saturating_sub(1),
+                    _ => {}
+                }
+            }
+            if nesting > 32 || literal > 32 {
+                return Err("content nesting limit exceeded".into());
+            }
+        }
+        if literal != 0 || nesting != 0 {
+            return Err("unterminated content operand".into());
+        }
+        let mut input = bytes.to_vec();
+        input.extend_from_slice(b"\nSuperbookNativeContentEnd\n");
+        let mut content = lopdf::content::Content::decode(&input).map_err(|e| e.to_string())?;
+        match content.operations.pop() {
+            Some(op) if op.operator == END && op.operands.is_empty() => Ok(content),
+            _ => Err("malformed content or unconsumed content suffix".into()),
+        }
+    }
+
+    /// Only baseline 8-bit JPEG with 1/3 components. Reject implicit CMYK/RGBA
+    /// conversion, progressive working sets, and truncated framing before decode.
+    fn verify_jpeg_header(
+        bytes: &[u8],
+        width: u32,
+        height: u32,
+        rgb: bool,
+    ) -> std::result::Result<(), String> {
+        if !bytes.starts_with(&[0xff, 0xd8]) || !bytes.ends_with(&[0xff, 0xd9]) {
+            return Err("JPEG must have complete SOI/EOI framing".into());
+        }
+        let mut pos = 2;
+        let mut frame = false;
+        while pos + 4 <= bytes.len() {
+            if bytes[pos] != 0xff {
+                return Err("invalid JPEG marker".into());
+            }
+            while bytes.get(pos) == Some(&0xff) {
+                pos += 1;
+            }
+            let marker = *bytes.get(pos).ok_or("truncated JPEG marker")?;
+            pos += 1;
+            let size = bytes.get(pos..pos + 2).ok_or("truncated JPEG segment")?;
+            let size = usize::from(u16::from_be_bytes([size[0], size[1]]));
+            if size < 2 {
+                return Err("invalid JPEG segment length".into());
+            }
+            let segment = bytes
+                .get(pos + 2..pos + size)
+                .ok_or("truncated JPEG segment")?;
+            if marker == 0xc0 {
+                let components = if rgb { 3 } else { 1 };
+                if frame
+                    || segment.len() != 6 + 3 * components
+                    || segment[0] != 8
+                    || u32::from(u16::from_be_bytes([segment[1], segment[2]])) != height
+                    || u32::from(u16::from_be_bytes([segment[3], segment[4]])) != width
+                    || usize::from(segment[5]) != components
+                {
+                    return Err("JPEG frame disagrees with supported native PDF image".into());
+                }
+                frame = true;
+            } else if (0xc1..=0xcf).contains(&marker) && !matches!(marker, 0xc4) {
+                return Err("only baseline Huffman JPEG is supported".into());
+            } else if marker == 0xda {
+                return if frame {
+                    Ok(())
+                } else {
+                    Err("JPEG scan before frame".into())
+                };
+            }
+            pos += size;
+        }
+        Err("missing JPEG scan".into())
+    }
+
+    fn native_image_metadata(
+        doc: &lopdf::Document,
+        object_id: lopdf::ObjectId,
+        stream: &lopdf::Stream,
+    ) -> std::result::Result<NativeImageMetadata, String> {
+        let positive_u32 = |name: &[u8]| {
+            stream
+                .dict
+                .get(name)
+                .ok()
+                .and_then(|value| Self::resolve_object(doc, value).ok())
+                .and_then(|value| value.as_i64().ok())
+                .and_then(|value| u32::try_from(value).ok())
+                .filter(|value| *value > 0)
+        };
+        let width = positive_u32(b"Width").ok_or_else(|| "invalid image Width".to_string())?;
+        let height = positive_u32(b"Height").ok_or_else(|| "invalid image Height".to_string())?;
+        let bits_per_component = stream
+            .dict
+            .get(b"BitsPerComponent")
+            .ok()
+            .and_then(|value| Self::resolve_object(doc, value).ok())
+            .and_then(|value| value.as_i64().ok())
+            .and_then(|value| u8::try_from(value).ok());
+        let color_space = stream
+            .dict
+            .get(b"ColorSpace")
+            .ok()
+            .map(|value| Self::pdf_object_json(doc, value, &mut HashSet::new(), 0))
+            .transpose()?;
+        let filters = Self::strict_filters(doc, &stream.dict)?;
+        let decode_params = stream
+            .dict
+            .get(b"DecodeParms")
+            .ok()
+            .map(|value| Self::pdf_object_json(doc, value, &mut HashSet::new(), 0))
+            .transpose()?;
+        if stream.dict.has(b"BitsPerComponent")
+            && !matches!(bits_per_component, Some(1 | 2 | 4 | 8 | 16))
+        {
+            return Err("invalid image BitsPerComponent".into());
+        }
+        let unsupported_semantics = [
+            b"Mask".as_slice(),
+            b"SMask",
+            b"Decode",
+            b"Alternates",
+            b"OPI",
+            b"OC",
+            b"F",
+            b"FFilter",
+            b"FDecodeParms",
+            b"SMaskInData",
+        ]
+        .iter()
+        .any(|key| stream.dict.has(key))
+            || stream
+                .dict
+                .get(b"ImageMask")
+                .is_ok_and(|value| !matches!(value, lopdf::Object::Boolean(false)))
+            || decode_params.as_ref().is_some_and(|value| !value.is_null());
+        let transform_decode = if unsupported_semantics {
+            NativeTransformDecodeCapability::Unsupported
+        } else {
+            Self::transform_decode_capability(&filters, bits_per_component, color_space.as_ref())
+        };
+        let digest = Sha256::digest(&stream.content);
+        Ok(NativeImageMetadata {
+            object_id: Self::pdf_object_id(object_id),
+            width,
+            height,
+            color_space,
+            bits_per_component,
+            filters,
+            decode_params,
+            encoded_length: stream.content.len(),
+            encoded_sha256: format!("{digest:x}"),
+            transform_decode,
+        })
+    }
+
+    fn transform_decode_capability(
+        filters: &[String],
+        bits_per_component: Option<u8>,
+        color_space: Option<&serde_json::Value>,
+    ) -> NativeTransformDecodeCapability {
+        let supported_color = matches!(
+            color_space,
+            Some(serde_json::Value::String(value))
+                if matches!(value.as_str(), "/DeviceGray" | "/DeviceRGB")
+        );
+        if bits_per_component != Some(8) || !supported_color {
+            return NativeTransformDecodeCapability::Unsupported;
+        }
+        match filters {
+            [filter] if filter == "DCTDecode" => NativeTransformDecodeCapability::Dct8,
+            [filter] if filter == "FlateDecode" => NativeTransformDecodeCapability::Flate8,
+            _ => NativeTransformDecodeCapability::Unsupported,
+        }
+    }
+
+    fn pdf_object_json(
+        doc: &lopdf::Document,
+        value: &lopdf::Object,
+        seen: &mut HashSet<lopdf::ObjectId>,
+        depth: usize,
+    ) -> std::result::Result<serde_json::Value, String> {
+        Self::pdf_object_json_bounded(doc, value, seen, depth, &mut 16_384)
+    }
+
+    fn pdf_object_json_bounded(
+        doc: &lopdf::Document,
+        value: &lopdf::Object,
+        seen: &mut HashSet<lopdf::ObjectId>,
+        depth: usize,
+        remaining_nodes: &mut usize,
+    ) -> std::result::Result<serde_json::Value, String> {
+        if *remaining_nodes == 0 {
+            return Err("PDF metadata expansion budget exhausted".to_string());
+        }
+        *remaining_nodes -= 1;
+        if matches!(value, lopdf::Object::Name(bytes) | lopdf::Object::String(bytes, _) if bytes.len() > 4096)
+        {
+            return Err("PDF metadata scalar exceeds 4096 bytes".to_string());
+        }
+        if depth >= 32 {
+            return Err("PDF metadata exceeds the 32-level safety limit".to_string());
+        }
+        match value {
+            lopdf::Object::Null => Ok(serde_json::Value::Null),
+            lopdf::Object::Boolean(value) => Ok(serde_json::Value::Bool(*value)),
+            lopdf::Object::Integer(value) => Ok((*value).into()),
+            lopdf::Object::Real(value) => serde_json::Number::from_f64(f64::from(*value))
+                .map(serde_json::Value::Number)
+                .ok_or_else(|| "PDF metadata contains a non-finite real number".to_string()),
+            lopdf::Object::Name(value) => Ok(serde_json::Value::String(format!(
+                "/{}",
+                Self::canonical_pdf_name(value)
+            ))),
+            lopdf::Object::String(value, format) => Ok(serde_json::json!({
+                "$pdf_string_hex": Self::hex_bytes(value),
+                "$pdf_string_format": format!("{format:?}").to_ascii_lowercase(),
+            })),
+            lopdf::Object::Array(values) => {
+                if values.len() > 4096 {
+                    return Err("PDF metadata array exceeds 4096 entries".to_string());
+                }
+                values
+                    .iter()
+                    .map(|value| {
+                        Self::pdf_object_json_bounded(doc, value, seen, depth + 1, remaining_nodes)
+                    })
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map(serde_json::Value::Array)
+            }
+            lopdf::Object::Dictionary(values) => {
+                if values.len() > 4096 {
+                    return Err("PDF metadata dictionary exceeds 4096 entries".to_string());
+                }
+                let mut map = serde_json::Map::new();
+                for (key, value) in values.iter() {
+                    if key.len() > 4096 {
+                        return Err("PDF metadata key exceeds 4096 bytes".to_string());
+                    }
+                    map.insert(
+                        Self::canonical_pdf_name(key),
+                        Self::pdf_object_json_bounded(
+                            doc,
+                            value,
+                            seen,
+                            depth + 1,
+                            remaining_nodes,
+                        )?,
+                    );
+                }
+                Ok(serde_json::Value::Object(map))
+            }
+            lopdf::Object::Reference(id) => {
+                if !seen.insert(*id) {
+                    return Err(format!("cycle in PDF metadata reference {id:?}"));
+                }
+                let value = doc.get_object(*id).map_err(|error| {
+                    format!("unresolved PDF metadata reference {id:?}: {error}")
+                })?;
+                let result =
+                    Self::pdf_object_json_bounded(doc, value, seen, depth + 1, remaining_nodes);
+                seen.remove(id);
+                result
+            }
+            lopdf::Object::Stream(_) => {
+                Err("PDF metadata unexpectedly contains a stream object".to_string())
+            }
+        }
+    }
+
+    fn canonical_pdf_name(bytes: &[u8]) -> String {
+        let mut result = String::new();
+        for byte in bytes {
+            if (b'!'..=b'~').contains(byte)
+                && !matches!(
+                    *byte,
+                    b'#' | b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%'
+                )
+            {
+                result.push(char::from(*byte));
+            } else {
+                result.push_str(&format!("#{byte:02X}"));
+            }
+        }
+        result
+    }
+
+    fn hex_bytes(bytes: &[u8]) -> String {
+        let mut result = String::with_capacity(bytes.len().saturating_mul(2));
+        for byte in bytes {
+            result.push_str(&format!("{byte:02x}"));
+        }
+        result
+    }
+
+    const fn pdf_object_id(id: lopdf::ObjectId) -> crate::transform_manifest::PdfObjectId {
+        crate::transform_manifest::PdfObjectId {
+            object_number: id.0,
+            generation: id.1,
+        }
+    }
+
     /// Extract all embedded JPEG images from a PDF
     ///
     /// This method extracts XObject images with DCTDecode filter (JPEG).
@@ -2618,5 +4412,705 @@ mod tests {
             "legacy object scan must still find orphan images"
         );
         assert_eq!(results[0].width, 640);
+    }
+
+    #[test]
+    fn native_inventory_preserves_physical_pages_and_nested_form_images() {
+        use lopdf::{dictionary, Document, Object, Stream};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let pdf_path = tmp.path().join("native-pages.pdf");
+        let mut doc = Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+
+        let form_image = doc.add_object(Object::Stream(make_test_image_stream(300, 400)));
+        let direct_image = doc.add_object(Object::Stream(make_test_image_stream(100, 200)));
+        let form = doc.add_object(Object::Stream(Stream::new(
+            dictionary! {
+                "Type" => Object::Name(b"XObject".to_vec()),
+                "Subtype" => Object::Name(b"Form".to_vec()),
+                "BBox" => Object::Array(vec![0.into(), 0.into(), 300.into(), 400.into()]),
+                "Resources" => Object::Dictionary(dictionary! {
+                    "XObject" => Object::Dictionary(dictionary! {
+                        "Nested" => Object::Reference(form_image),
+                    }),
+                }),
+            },
+            b"q /Nested Do Q".to_vec(),
+        )));
+        let direct_content =
+            doc.add_object(Stream::new(dictionary! {}, b"q /Direct Do Q".to_vec()));
+        let form_content = doc.add_object(Stream::new(dictionary! {}, b"q /Form0 Do Q".to_vec()));
+
+        let direct_page = doc.add_object(dictionary! {
+            "Type" => Object::Name(b"Page".to_vec()),
+            "Parent" => Object::Reference(pages_id),
+            "MediaBox" => Object::Array(vec![10.into(), 20.into(), 622.into(), 812.into()]),
+            "CropBox" => Object::Array(vec![12.into(), 22.into(), 620.into(), 810.into()]),
+            "Rotate" => Object::Integer(90),
+            "Resources" => Object::Dictionary(dictionary! {
+                "XObject" => Object::Dictionary(dictionary! {
+                    "Direct" => Object::Reference(direct_image),
+                }),
+            }),
+            "Contents" => Object::Reference(direct_content),
+        });
+        let blank_page = doc.add_object(dictionary! {
+            "Type" => Object::Name(b"Page".to_vec()),
+            "Parent" => Object::Reference(pages_id),
+            "MediaBox" => Object::Array(vec![0.into(), 0.into(), 400.into(), 600.into()]),
+        });
+        let form_page = doc.add_object(dictionary! {
+            "Type" => Object::Name(b"Page".to_vec()),
+            "Parent" => Object::Reference(pages_id),
+            "MediaBox" => Object::Array(vec![0.into(), 0.into(), 500.into(), 700.into()]),
+            "Resources" => Object::Dictionary(dictionary! {
+                "XObject" => Object::Dictionary(dictionary! {
+                    "Form0" => Object::Reference(form),
+                }),
+            }),
+            "Contents" => Object::Reference(form_content),
+        });
+
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => Object::Name(b"Pages".to_vec()),
+                "Kids" => Object::Array(vec![
+                    Object::Reference(direct_page),
+                    Object::Reference(blank_page),
+                    Object::Reference(form_page),
+                ]),
+                "Count" => Object::Integer(3),
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => Object::Name(b"Catalog".to_vec()),
+            "Pages" => Object::Reference(pages_id),
+        });
+        doc.trailer.set("Root", catalog_id);
+        doc.save(&pdf_path).unwrap();
+
+        let pages = LopdfExtractor::inspect_native_pages(&pdf_path).unwrap();
+        assert_eq!(pages.len(), 3);
+        assert_eq!(
+            pages
+                .iter()
+                .map(|page| page.physical_page.page_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(pages[0].kind, NativePageKind::SingleImage);
+        assert_eq!(pages[1].kind, NativePageKind::Blank);
+        assert_eq!(
+            pages[2].kind,
+            NativePageKind::UnsupportedContent,
+            "{:?}",
+            pages[2].issues
+        );
+        assert!(!pages[0].review_required);
+        assert!(!pages[1].review_required);
+        assert!(pages[2].review_required);
+        assert_eq!(
+            pages[0].image_invocations[0]
+                .metadata
+                .object_id
+                .object_number,
+            direct_image.0
+        );
+        assert_eq!(
+            pages[2].image_invocations[0]
+                .metadata
+                .object_id
+                .object_number,
+            form_image.0
+        );
+        assert_eq!(
+            pages[0]
+                .physical_page
+                .media_box
+                .as_ref()
+                .unwrap()
+                .value
+                .coordinates(),
+            [10.0, 20.0, 622.0, 812.0]
+        );
+        assert_eq!(
+            pages[0]
+                .physical_page
+                .crop_box
+                .as_ref()
+                .unwrap()
+                .value
+                .coordinates(),
+            [12.0, 22.0, 620.0, 810.0]
+        );
+        assert_eq!(pages[0].physical_page.normalized_rotation(), Some(90));
+    }
+
+    #[test]
+    fn native_inventory_retains_dct_flate_and_ccitt_metadata() {
+        use lopdf::{dictionary, Document, Object, Stream};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let pdf_path = tmp.path().join("native-filters.pdf");
+        let mut doc = Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let specifications = [
+            (
+                "DCTDecode",
+                Object::Name(b"DeviceRGB".to_vec()),
+                8_i64,
+                Object::Null,
+                vec![1_u8, 2, 3, 4],
+            ),
+            (
+                "FlateDecode",
+                Object::Name(b"DeviceGray".to_vec()),
+                8_i64,
+                Object::Dictionary(dictionary! {
+                    "Predictor" => Object::Integer(12),
+                    "Columns" => Object::Integer(16),
+                }),
+                vec![5_u8, 6, 7],
+            ),
+            (
+                "CCITTFaxDecode",
+                Object::Name(b"DeviceGray".to_vec()),
+                1_i64,
+                Object::Dictionary(dictionary! {
+                    "K" => Object::Integer(-1),
+                    "Columns" => Object::Integer(16),
+                    "Rows" => Object::Integer(16),
+                    "BlackIs1" => Object::Boolean(true),
+                }),
+                vec![8_u8, 9],
+            ),
+        ];
+        let mut kids = Vec::new();
+        let mut expected_ids = Vec::new();
+        for (index, (filter, color_space, bits, decode_params, bytes)) in
+            specifications.into_iter().enumerate()
+        {
+            let mut image_dict = dictionary! {
+                "Type" => Object::Name(b"XObject".to_vec()),
+                "Subtype" => Object::Name(b"Image".to_vec()),
+                "Width" => Object::Integer(16),
+                "Height" => Object::Integer(16),
+                "ColorSpace" => color_space,
+                "BitsPerComponent" => Object::Integer(bits),
+                "Filter" => Object::Name(filter.as_bytes().to_vec()),
+            };
+            if decode_params != Object::Null {
+                image_dict.set("DecodeParms", decode_params);
+            }
+            let image_id = doc.add_object(Object::Stream(Stream::new(image_dict, bytes)));
+            expected_ids.push(image_id);
+            let content = doc.add_object(Stream::new(
+                dictionary! {},
+                format!("q /Im{index} Do Q").into_bytes(),
+            ));
+            let image_name = format!("Im{index}").into_bytes();
+            let mut xobjects = lopdf::Dictionary::new();
+            xobjects.set(image_name, Object::Reference(image_id));
+            let page_id = doc.add_object(dictionary! {
+                "Type" => Object::Name(b"Page".to_vec()),
+                "Parent" => Object::Reference(pages_id),
+                "MediaBox" => Object::Array(vec![0.into(), 0.into(), 612.into(), 792.into()]),
+                "Resources" => Object::Dictionary(dictionary! {
+                    "XObject" => Object::Dictionary(xobjects),
+                }),
+                "Contents" => Object::Reference(content),
+            });
+            kids.push(Object::Reference(page_id));
+        }
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => Object::Name(b"Pages".to_vec()),
+                "Kids" => Object::Array(kids),
+                "Count" => Object::Integer(3),
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => Object::Name(b"Catalog".to_vec()),
+            "Pages" => Object::Reference(pages_id),
+        });
+        doc.trailer.set("Root", catalog_id);
+        doc.save(&pdf_path).unwrap();
+
+        let pages = LopdfExtractor::inspect_native_pages(&pdf_path).unwrap();
+        assert_eq!(pages.len(), 3);
+        for (index, expected_filter) in ["DCTDecode", "FlateDecode", "CCITTFaxDecode"]
+            .into_iter()
+            .enumerate()
+        {
+            let image = &pages[index].image_invocations[0].metadata;
+            assert_eq!(pages[index].kind, NativePageKind::SingleImage);
+            assert_eq!(image.object_id.object_number, expected_ids[index].0);
+            assert_eq!(image.width, 16);
+            assert_eq!(image.height, 16);
+            assert_eq!(image.filters, vec![expected_filter]);
+            assert_eq!(image.encoded_sha256.len(), 64);
+        }
+        assert_eq!(
+            pages[0].image_invocations[0].metadata.color_space,
+            Some(serde_json::json!("/DeviceRGB"))
+        );
+        assert_eq!(
+            pages[0].image_invocations[0].metadata.bits_per_component,
+            Some(8)
+        );
+        assert_eq!(
+            pages[1].image_invocations[0].metadata.color_space,
+            Some(serde_json::json!("/DeviceGray"))
+        );
+        assert_eq!(
+            pages[2].image_invocations[0].metadata.bits_per_component,
+            Some(1)
+        );
+        assert_eq!(
+            pages[2].image_invocations[0]
+                .metadata
+                .decode_params
+                .as_ref()
+                .unwrap()["K"],
+            serde_json::json!(-1)
+        );
+        assert_eq!(
+            pages[2].image_invocations[0]
+                .metadata
+                .decode_params
+                .as_ref()
+                .unwrap()["BlackIs1"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            pages[0].image_invocations[0].metadata.transform_decode,
+            NativeTransformDecodeCapability::Dct8
+        );
+        assert_eq!(
+            pages[1].image_invocations[0].metadata.transform_decode,
+            NativeTransformDecodeCapability::Unsupported
+        );
+        assert_eq!(
+            pages[2].image_invocations[0].metadata.transform_decode,
+            NativeTransformDecodeCapability::Unsupported
+        );
+
+        let projected = pages[0].image_invocations[0]
+            .metadata
+            .to_manifest_v1()
+            .unwrap();
+        assert_eq!(
+            projected.object_id.unwrap().object_number,
+            expected_ids[0].0
+        );
+        assert_eq!(projected.filter.as_deref(), Some("DCTDecode"));
+        assert_eq!(projected.color_space.as_deref(), Some("/DeviceRGB"));
+
+        let mut complex_filter = pages[0].image_invocations[0].metadata.clone();
+        complex_filter.filters.push("ASCII85Decode".to_string());
+        assert!(matches!(
+            complex_filter.to_manifest_v1(),
+            Err(ManifestV1ProjectionError::FilterChainNotRepresentable)
+        ));
+    }
+
+    #[test]
+    fn native_inventory_inherits_geometry_and_fails_closed_per_page() {
+        use lopdf::{dictionary, Document, Object, Stream};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let pdf_path = tmp.path().join("native-classification.pdf");
+        let mut doc = Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let image = doc.add_object(Object::Stream(make_test_image_stream(640, 960)));
+        let repeated = doc.add_object(Stream::new(
+            dictionary! {},
+            b"q /Scan Do Q q /Scan Do Q".to_vec(),
+        ));
+        let drawing = doc.add_object(Stream::new(dictionary! {}, b"q 1 0 0 1 0 0 cm Q".to_vec()));
+        let missing = doc.add_object(Stream::new(dictionary! {}, b"q /Missing Do Q".to_vec()));
+
+        let mut kids = Vec::new();
+        for (contents, media_box) in [
+            (Some(repeated), None),
+            (Some(drawing), None),
+            (Some(missing), None),
+            (None, None),
+            (
+                None,
+                Some(Object::Array(vec![0.into(), 0.into(), 0.into(), 10.into()])),
+            ),
+        ] {
+            let mut page = dictionary! {
+                "Type" => Object::Name(b"Page".to_vec()),
+                "Parent" => Object::Reference(pages_id),
+            };
+            if let Some(contents) = contents {
+                page.set("Contents", Object::Reference(contents));
+            }
+            if let Some(media_box) = media_box {
+                page.set("MediaBox", media_box);
+            }
+            kids.push(Object::Reference(doc.add_object(page)));
+        }
+
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => Object::Name(b"Pages".to_vec()),
+                "Kids" => Object::Array(kids),
+                "Count" => Object::Integer(5),
+                "MediaBox" => Object::Array(vec![1.into(), 2.into(), 401.into(), 602.into()]),
+                "CropBox" => Object::Array(vec![3.into(), 4.into(), 399.into(), 600.into()]),
+                "Rotate" => Object::Integer(-90),
+                "Resources" => Object::Dictionary(dictionary! {
+                    "XObject" => Object::Dictionary(dictionary! {
+                        "Scan" => Object::Reference(image),
+                    }),
+                }),
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => Object::Name(b"Catalog".to_vec()),
+            "Pages" => Object::Reference(pages_id),
+        });
+        doc.trailer.set("Root", catalog_id);
+        doc.save(&pdf_path).unwrap();
+
+        let pages = LopdfExtractor::inspect_native_pages(&pdf_path).unwrap();
+        assert_eq!(pages.len(), 5);
+        assert_eq!(pages[0].kind, NativePageKind::MultipleImages);
+        assert_eq!(pages[0].image_invocations.len(), 2);
+        assert!(pages[0].review_required);
+        assert_eq!(pages[1].kind, NativePageKind::NonImageContent);
+        assert!(pages[1].review_required);
+        assert_eq!(pages[2].kind, NativePageKind::UnsupportedContent);
+        assert!(pages[2].review_required);
+        assert!(pages[2]
+            .issues
+            .iter()
+            .any(|issue| issue.code == NativePageIssueCode::UnresolvedXObject));
+        assert_eq!(pages[3].kind, NativePageKind::Blank);
+        assert!(!pages[3].review_required);
+        assert_eq!(pages[3].physical_page.normalized_rotation(), Some(270));
+        assert_eq!(
+            pages[3]
+                .physical_page
+                .media_box
+                .as_ref()
+                .unwrap()
+                .value
+                .coordinates(),
+            [1.0, 2.0, 401.0, 602.0]
+        );
+        assert_eq!(
+            pages[3]
+                .physical_page
+                .crop_box
+                .as_ref()
+                .unwrap()
+                .value
+                .coordinates(),
+            [3.0, 4.0, 399.0, 600.0]
+        );
+        assert_eq!(pages[4].kind, NativePageKind::UnsupportedContent);
+        assert!(pages[4].physical_page.media_box.is_none());
+        assert!(pages[4].review_required);
+    }
+
+    #[test]
+    fn native_inventory_tracks_binding_matrix_and_composite_paint() {
+        use lopdf::{dictionary, Document, Object, Stream};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let pdf_path = tmp.path().join("native-binding.pdf");
+        let mut doc = Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let scan = doc.add_object(Object::Stream(make_test_image_stream(640, 960)));
+        let unused = doc.add_object(Object::Stream(make_test_image_stream(20, 20)));
+        let direct_content = doc.add_object(Stream::new(
+            dictionary! {},
+            b"q 100 0 0 200 10 20 cm /Scan Do Q".to_vec(),
+        ));
+        let composite_content = doc.add_object(Stream::new(
+            dictionary! {},
+            b"q /Scan Do Q BT (caption) Tj ET".to_vec(),
+        ));
+        let resources = Object::Dictionary(dictionary! {
+            "XObject" => Object::Dictionary(dictionary! {
+                "Scan" => Object::Reference(scan),
+                "Unused" => Object::Reference(unused),
+            }),
+        });
+        let first_id = doc.add_object(dictionary! {
+            "Type" => Object::Name(b"Page".to_vec()),
+            "Parent" => Object::Reference(pages_id),
+            "MediaBox" => Object::Array(vec![0.into(), 0.into(), 612.into(), 792.into()]),
+            "Resources" => resources.clone(),
+            "Contents" => Object::Reference(direct_content),
+        });
+        let second_id = doc.add_object(dictionary! {
+            "Type" => Object::Name(b"Page".to_vec()),
+            "Parent" => Object::Reference(pages_id),
+            "MediaBox" => Object::Array(vec![0.into(), 0.into(), 612.into(), 792.into()]),
+            "Resources" => resources,
+            "Contents" => Object::Reference(composite_content),
+        });
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => Object::Name(b"Pages".to_vec()),
+                "Kids" => Object::Array(vec![first_id.into(), second_id.into()]),
+                "Count" => Object::Integer(2),
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => Object::Name(b"Catalog".to_vec()),
+            "Pages" => Object::Reference(pages_id),
+        });
+        doc.trailer.set("Root", catalog_id);
+        doc.save(&pdf_path).unwrap();
+
+        let pages = LopdfExtractor::inspect_native_pages(&pdf_path).unwrap();
+        assert_eq!(pages[0].kind, NativePageKind::SingleImage);
+        assert_eq!(pages[0].image_invocations.len(), 1);
+        assert_eq!(
+            pages[0].image_invocations[0]
+                .metadata
+                .object_id
+                .object_number,
+            scan.0
+        );
+        assert_eq!(pages[0].image_invocations[0].binding.resource_path.len(), 1);
+        assert_eq!(
+            pages[0].image_invocations[0].binding.resource_path[0].resource_name,
+            b"Scan"
+        );
+        assert!(pages[0].image_invocations[0].binding.is_direct);
+        assert_eq!(
+            pages[0].image_invocations[0]
+                .binding
+                .placement_matrix
+                .coordinates(),
+            [100.0, 0.0, 0.0, 200.0, 10.0, 20.0]
+        );
+
+        assert_eq!(pages[1].kind, NativePageKind::CompositeContent);
+        assert_eq!(pages[1].image_invocations.len(), 1);
+        assert!(pages[1].review_required);
+    }
+
+    #[test]
+    fn native_document_retains_source_stream_access_without_outputs() {
+        use lopdf::{dictionary, Document, Object, Stream};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let pdf_path = tmp.path().join("native-document.pdf");
+        let encoded = vec![11_u8, 22, 33, 44, 55];
+        let mut doc = Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let image_id = doc.add_object(Object::Stream(Stream::new(
+            dictionary! {
+                "Type" => Object::Name(b"XObject".to_vec()),
+                "Subtype" => Object::Name(b"Image".to_vec()),
+                "Width" => Object::Integer(1),
+                "Height" => Object::Integer(1),
+                "ColorSpace" => Object::Name(b"DeviceGray".to_vec()),
+                "BitsPerComponent" => Object::Integer(8),
+                "Filter" => Object::Name(b"FlateDecode".to_vec()),
+            },
+            encoded.clone(),
+        )));
+        let content_id = doc.add_object(Stream::new(dictionary! {}, b"/Scan Do".to_vec()));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => Object::Name(b"Page".to_vec()),
+            "Parent" => Object::Reference(pages_id),
+            "MediaBox" => Object::Array(vec![0.into(), 0.into(), 10.into(), 10.into()]),
+            "Resources" => Object::Dictionary(dictionary! {
+                "XObject" => Object::Dictionary(dictionary! {
+                    "Scan" => Object::Reference(image_id),
+                }),
+            }),
+            "Contents" => Object::Reference(content_id),
+        });
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => Object::Name(b"Pages".to_vec()),
+                "Kids" => Object::Array(vec![page_id.into()]),
+                "Count" => Object::Integer(1),
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => Object::Name(b"Catalog".to_vec()),
+            "Pages" => Object::Reference(pages_id),
+        });
+        doc.trailer.set("Root", catalog_id);
+        doc.save(&pdf_path).unwrap();
+
+        let native = NativePdfExtractor::extract_path(&pdf_path).unwrap();
+        assert_eq!(native.pages().len(), 1);
+        assert_eq!(
+            native.pages()[0].physical_page.page_object_id.object_number,
+            page_id.0
+        );
+        let invocation = &native.pages()[0].image_invocations[0];
+        assert_eq!(
+            native.encoded_image_bytes(&invocation.metadata).unwrap(),
+            encoded
+        );
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn native_inventory_composes_nested_form_matrices_and_paths() {
+        use lopdf::{dictionary, Document, Object, Stream};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let pdf_path = tmp.path().join("nested-form-binding.pdf");
+        let mut doc = Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let image_id = doc.add_object(Object::Stream(make_test_image_stream(10, 10)));
+        let inner_form = doc.add_object(Object::Stream(Stream::new(
+            dictionary! {
+                "Type" => Object::Name(b"XObject".to_vec()),
+                "Subtype" => Object::Name(b"Form".to_vec()),
+                "BBox" => Object::Array(vec![0.into(), 0.into(), 1.into(), 1.into()]),
+                "Matrix" => Object::Array(vec![2.into(), 0.into(), 0.into(), 3.into(), 5.into(), 7.into()]),
+                "Resources" => Object::Dictionary(dictionary! {
+                    "XObject" => Object::Dictionary(dictionary! {
+                        "Image" => Object::Reference(image_id),
+                    }),
+                }),
+            },
+            b"/Image Do".to_vec(),
+        )));
+        let outer_form = doc.add_object(Object::Stream(Stream::new(
+            dictionary! {
+                "Type" => Object::Name(b"XObject".to_vec()),
+                "Subtype" => Object::Name(b"Form".to_vec()),
+                "BBox" => Object::Array(vec![0.into(), 0.into(), 1.into(), 1.into()]),
+                "Matrix" => Object::Array(vec![1.into(), 0.into(), 0.into(), 1.into(), 4.into(), 6.into()]),
+                "Resources" => Object::Dictionary(dictionary! {
+                    "XObject" => Object::Dictionary(dictionary! {
+                        "Inner" => Object::Reference(inner_form),
+                    }),
+                }),
+            },
+            b"/Inner Do".to_vec(),
+        )));
+        let content_id = doc.add_object(Stream::new(
+            dictionary! {},
+            b"10 0 0 20 1 2 cm /Outer Do".to_vec(),
+        ));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => Object::Name(b"Page".to_vec()),
+            "Parent" => Object::Reference(pages_id),
+            "MediaBox" => Object::Array(vec![0.into(), 0.into(), 100.into(), 100.into()]),
+            "Resources" => Object::Dictionary(dictionary! {
+                "XObject" => Object::Dictionary(dictionary! {
+                    "Outer" => Object::Reference(outer_form),
+                }),
+            }),
+            "Contents" => Object::Reference(content_id),
+        });
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => Object::Name(b"Pages".to_vec()),
+                "Kids" => Object::Array(vec![page_id.into()]),
+                "Count" => Object::Integer(1),
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => Object::Name(b"Catalog".to_vec()),
+            "Pages" => Object::Reference(pages_id),
+        });
+        doc.trailer.set("Root", catalog_id);
+        doc.save(&pdf_path).unwrap();
+
+        let pages = LopdfExtractor::inspect_native_pages(&pdf_path).unwrap();
+        let binding = &pages[0].image_invocations[0].binding;
+        assert_eq!(
+            binding
+                .resource_path
+                .iter()
+                .map(|step| step.resource_name.as_slice())
+                .collect::<Vec<_>>(),
+            vec![
+                b"Outer".as_slice(),
+                b"Inner".as_slice(),
+                b"Image".as_slice()
+            ]
+        );
+        assert_eq!(
+            binding.placement_matrix.coordinates(),
+            [20.0, 0.0, 0.0, 60.0, 91.0, 262.0]
+        );
+        assert!(!binding.is_direct);
+    }
+
+    #[test]
+    fn native_inventory_contains_form_cycles_at_page_scope() {
+        use lopdf::{dictionary, Document, Object, Stream};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let pdf_path = tmp.path().join("form-cycle.pdf");
+        let mut doc = Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let form_id = doc.new_object_id();
+        doc.objects.insert(
+            form_id,
+            Object::Stream(Stream::new(
+                dictionary! {
+                    "Type" => Object::Name(b"XObject".to_vec()),
+                    "Subtype" => Object::Name(b"Form".to_vec()),
+                    "BBox" => Object::Array(vec![0.into(), 0.into(), 1.into(), 1.into()]),
+                    "Resources" => Object::Dictionary(dictionary! {
+                        "XObject" => Object::Dictionary(dictionary! {
+                            "Self" => Object::Reference(form_id),
+                        }),
+                    }),
+                },
+                b"/Self Do".to_vec(),
+            )),
+        );
+        let content_id = doc.add_object(Stream::new(dictionary! {}, b"/Cycle Do".to_vec()));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => Object::Name(b"Page".to_vec()),
+            "Parent" => Object::Reference(pages_id),
+            "MediaBox" => Object::Array(vec![0.into(), 0.into(), 10.into(), 10.into()]),
+            "Resources" => Object::Dictionary(dictionary! {
+                "XObject" => Object::Dictionary(dictionary! {
+                    "Cycle" => Object::Reference(form_id),
+                }),
+            }),
+            "Contents" => Object::Reference(content_id),
+        });
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => Object::Name(b"Pages".to_vec()),
+                "Kids" => Object::Array(vec![page_id.into()]),
+                "Count" => Object::Integer(1),
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => Object::Name(b"Catalog".to_vec()),
+            "Pages" => Object::Reference(pages_id),
+        });
+        doc.trailer.set("Root", catalog_id);
+        doc.save(&pdf_path).unwrap();
+
+        let pages = LopdfExtractor::inspect_native_pages(&pdf_path).unwrap();
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].kind, NativePageKind::UnsupportedContent);
+        assert!(pages[0]
+            .issues
+            .iter()
+            .any(|issue| issue.code == NativePageIssueCode::FormCycle));
     }
 }

@@ -223,7 +223,15 @@ pub(crate) fn prepare(
         if let Some(outcome) = pipeline.analyze_rotation(index, &input)? {
             record.rotation = outcome.transform;
             record.review_required |= outcome.review_required;
-            if outcome.should_apply {
+            if outcome.should_apply && invocation.metadata.bits_per_component == Some(1) {
+                record.rotation.decision = TransformDecision::Rejected;
+                record.rotation.reason = "bilevel_rotation_requires_lossless_encoder".into();
+                record.review_required = true;
+                record.notes.push(
+                    "bilevel_rotation_requires_lossless_encoder: one-bit CCITT source retained unchanged"
+                        .into(),
+                );
+            } else if outcome.should_apply {
                 image = ImageProcDeskewer::rotate_180_exact(&image);
                 input = work.join(format!("page-{index}-rotated.png"));
                 image
@@ -338,6 +346,69 @@ pub(crate) mod tests {
             kids.push(Object::Reference(doc.add_object(dictionary! {"Type"=>"Page", "Parent"=>pages, "Contents"=>content, "MediaBox"=>vec![0.into(),0.into(),600.into(),800.into()]})));
         }
         doc.objects.insert(pages, Object::Dictionary(dictionary! {"Type"=>"Pages", "Count"=>kids.len() as i64, "Kids"=>kids, "Resources"=>resources}));
+        let root = doc.add_object(dictionary! {"Type"=>"Catalog", "Pages"=>pages});
+        doc.trailer.set("Root", root);
+        let path = dir.path().join("source.pdf");
+        doc.save(&path).unwrap();
+        let native = NativePdfExtractor::extract_path(&path).unwrap();
+        (dir, native)
+    }
+
+    pub(crate) fn ccitt_fixture(
+        contents: &[&[u8]],
+        image: &DynamicImage,
+    ) -> (tempfile::TempDir, NativePdfDocument) {
+        let grayscale = image.as_luma8().expect("bilevel grayscale fixture");
+        let width = u16::try_from(grayscale.width()).unwrap();
+        let mut encoder = fax::encoder::Encoder::new(fax::VecWriter::new());
+        for row in grayscale.rows() {
+            encoder
+                .encode_line(
+                    row.map(|pixel| match pixel.0[0] {
+                        0 => fax::Color::Black,
+                        255 => fax::Color::White,
+                        value => panic!("non-bilevel fixture sample {value}"),
+                    }),
+                    width,
+                )
+                .unwrap();
+        }
+        let encoded = encoder.finish().unwrap().finish();
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut doc = Document::with_version("1.7");
+        let pages = doc.new_object_id();
+        let img = doc.add_object(Stream::new(
+            dictionary! {
+                "Type"=>"XObject", "Subtype"=>"Image",
+                "Width"=>i64::from(grayscale.width()),
+                "Height"=>i64::from(grayscale.height()),
+                "BitsPerComponent"=>1, "ColorSpace"=>"DeviceGray",
+                "Filter"=>"CCITTFaxDecode",
+                "DecodeParms"=>dictionary! {
+                    "Columns"=>i64::from(grayscale.width()),
+                    "Rows"=>i64::from(grayscale.height()),
+                    "K"=>-1,
+                },
+            },
+            encoded,
+        ));
+        let resources = doc.add_object(dictionary! {"XObject"=>dictionary! {"Scan"=>img}});
+        let mut kids = Vec::new();
+        for bytes in contents {
+            let content = doc.add_object(Stream::new(dictionary! {}, bytes.to_vec()));
+            kids.push(Object::Reference(doc.add_object(dictionary! {
+                "Type"=>"Page", "Parent"=>pages, "Contents"=>content,
+                "MediaBox"=>vec![0.into(),0.into(),600.into(),800.into()]
+            })));
+        }
+        doc.objects.insert(
+            pages,
+            Object::Dictionary(dictionary! {
+                "Type"=>"Pages", "Count"=>kids.len() as i64, "Kids"=>kids,
+                "Resources"=>resources
+            }),
+        );
         let root = doc.add_object(dictionary! {"Type"=>"Catalog", "Pages"=>pages});
         doc.trailer.set("Root", root);
         let path = dir.path().join("source.pdf");
@@ -498,6 +569,31 @@ pub(crate) mod tests {
             .analyze_deskew(0, &work.join("page-0-rotated.png"), false)
             .unwrap();
         assert_eq!(page.deskew, expected.transform);
+    }
+
+    #[test]
+    fn bilevel_ccitt_rotation_apply_fails_closed_without_bit_depth_conversion() {
+        let image = upside_down_text();
+        let (dir, native) = ccitt_fixture(&[SCAN], &image);
+        let result = prepare(
+            &native,
+            &pipeline(GeometryAction::Apply, GeometryAction::Report),
+            &dir.path().join("work"),
+        )
+        .unwrap();
+        assert!(result.same_size.is_empty() && result.expanded.is_empty());
+        let page = &result.pages[0];
+        assert_eq!(page.rotation.decision, TransformDecision::Rejected);
+        assert_eq!(
+            page.rotation.reason,
+            "bilevel_rotation_requires_lossless_encoder"
+        );
+        assert!(page.review_required);
+        assert!(!page.rotation_pixels_changed && !page.deskew_input_after_rotation);
+        assert!(page
+            .notes
+            .iter()
+            .any(|note| note.contains("one-bit CCITT source retained unchanged")));
     }
     pub(crate) fn skewed_edge(angle: f64) -> DynamicImage {
         let mut image = GrayImage::from_pixel(320, 480, Luma([255]));

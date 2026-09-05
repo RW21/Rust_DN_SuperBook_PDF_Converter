@@ -86,6 +86,17 @@ mod native_hardening_tests {
         )
     }
 
+    fn ccitt_stream(bytes: &[u8], width: i64, height: i64, decode_params: Object) -> Stream {
+        Stream::new(
+            dictionary! {
+                "Type" => "XObject", "Subtype" => "Image", "Width" => width, "Height" => height,
+                "ColorSpace" => "DeviceGray", "BitsPerComponent" => 1,
+                "Filter" => "CCITTFaxDecode", "DecodeParms" => decode_params,
+            },
+            bytes.to_vec(),
+        )
+    }
+
     fn fixture(stream: Stream, contents: Vec<Object>) -> (Document, lopdf::ObjectId) {
         let mut doc = Document::with_version("1.7");
         let pages_id = doc.new_object_id();
@@ -151,6 +162,187 @@ mod native_hardening_tests {
                     .decode_image(meta, expected.len() as u64 - 1)
                     .is_err());
             }
+        }
+    }
+
+    #[test]
+    fn native_decode_ccitt_group3_1d_all_white_is_bounded_and_preserves_encoded_stream() {
+        // T.4 white run of 8 is 10011. Two rows are concatenated without EOLs.
+        let encoded = [0b1001_1100, 0b1100_0000];
+        let stream = ccitt_stream(
+            &encoded,
+            8,
+            2,
+            Object::Dictionary(dictionary! { "Columns" => 8, "Rows" => 2, "K" => 0 }),
+        );
+        let (mut doc, _) = fixture(stream, vec![content(b"/Scan Do")]);
+        let (_dir, native) = load(&mut doc);
+        let page = &native.pages()[0];
+        let meta = &page.image_invocations[0].metadata;
+
+        assert_eq!(
+            meta.transform_decode,
+            NativeTransformDecodeCapability::Ccitt1
+        );
+        assert!(!page.review_required);
+        assert_eq!(native.encoded_image_bytes(meta).unwrap(), encoded);
+        assert_eq!(
+            native.decode_image(meta, 16).unwrap().as_bytes(),
+            &[255; 16]
+        );
+        assert!(matches!(
+            native.decode_image(meta, 15),
+            Err(NativeExtractError::DecodeLimit)
+        ));
+
+        // The declared row count ends this raster after ten meaningful bits. Remaining
+        // bits in that final byte are terminal padding rather than another CCITT code.
+        let padded = ccitt_stream(
+            &[0b1001_1100, 0b1100_0001],
+            8,
+            2,
+            Object::Dictionary(dictionary! { "Columns" => 8, "Rows" => 2, "K" => 0 }),
+        );
+        let (mut doc, _) = fixture(padded, vec![content(b"/Scan Do")]);
+        let (_dir, native) = load(&mut doc);
+        let meta = &native.pages()[0].image_invocations[0].metadata;
+        assert_eq!(
+            native.decode_image(meta, 16).unwrap().as_bytes(),
+            &[255; 16]
+        );
+    }
+
+    #[test]
+    fn native_decode_ccitt_applies_black_is_1_and_group4() {
+        let cases = [
+            (
+                vec![0b1001_1100, 0b1100_0000],
+                dictionary! {
+                    "Columns" => 8, "Rows" => 2, "K" => 0, "BlackIs1" => true,
+                },
+                0_u8,
+            ),
+            // T.6 vertical-0 (1) against an all-white reference line, twice.
+            (
+                vec![0b1100_0000],
+                dictionary! { "Columns" => 8, "Rows" => 2, "K" => -1 },
+                255_u8,
+            ),
+        ];
+
+        for (encoded, params, expected) in cases {
+            let stream = ccitt_stream(&encoded, 8, 2, Object::Dictionary(params));
+            let (mut doc, _) = fixture(stream, vec![content(b"/Scan Do")]);
+            let (_dir, native) = load(&mut doc);
+            let meta = &native.pages()[0].image_invocations[0].metadata;
+            assert_eq!(
+                meta.transform_decode,
+                NativeTransformDecodeCapability::Ccitt1
+            );
+            assert_eq!(
+                native.decode_image(meta, 16).unwrap().as_bytes(),
+                &[expected; 16]
+            );
+        }
+    }
+
+    #[test]
+    fn native_ccitt_decode_params_are_strict_and_do_not_relax_other_filters() {
+        let invalid = [
+            Object::Array(vec![Object::Dictionary(dictionary! {
+                "Columns" => 8, "Rows" => 2,
+            })]),
+            Object::Dictionary(dictionary! { "Columns" => 7, "Rows" => 2 }),
+            Object::Dictionary(dictionary! { "Columns" => 8, "Rows" => 3 }),
+            Object::Dictionary(dictionary! { "Columns" => 8 }),
+            Object::Dictionary(dictionary! { "Rows" => 2 }),
+            Object::Dictionary(dictionary! {
+                "Columns" => 8, "Rows" => 2, "K" => Object::Real(0.5),
+            }),
+            Object::Dictionary(dictionary! { "Columns" => 8, "Rows" => 2, "K" => 1 }),
+            Object::Dictionary(dictionary! {
+                "Columns" => 8, "Rows" => 2, "EndOfLine" => 0,
+            }),
+            Object::Dictionary(dictionary! {
+                "Columns" => 8, "Rows" => 2, "EndOfLine" => true,
+            }),
+            Object::Dictionary(dictionary! {
+                "Columns" => 8, "Rows" => 2, "EncodedByteAlign" => true,
+            }),
+            Object::Dictionary(dictionary! {
+                "Columns" => 8, "Rows" => 2, "DamagedRowsBeforeError" => 1,
+            }),
+            Object::Dictionary(dictionary! {
+                "Columns" => 8, "Rows" => 2, "Unknown" => false,
+            }),
+        ];
+
+        for params in invalid {
+            let stream = ccitt_stream(&[0b1001_1100, 0b1100_0000], 8, 2, params);
+            let (mut doc, _) = fixture(stream, vec![content(b"/Scan Do")]);
+            let (_dir, native) = load(&mut doc);
+            let page = &native.pages()[0];
+            let meta = &page.image_invocations[0].metadata;
+            assert_eq!(
+                meta.transform_decode,
+                NativeTransformDecodeCapability::Unsupported
+            );
+            assert!(page.review_required);
+            assert!(native.decode_image(meta, 16).is_err());
+        }
+
+        let mut flate = image_stream(false, false);
+        flate.dict.set(
+            "DecodeParms",
+            Object::Dictionary(dictionary! { "Columns" => 2, "Rows" => 2, "K" => 0 }),
+        );
+        let (mut doc, _) = fixture(flate, vec![content(b"/Scan Do")]);
+        let (_dir, native) = load(&mut doc);
+        assert_eq!(
+            native.pages()[0].image_invocations[0]
+                .metadata
+                .transform_decode,
+            NativeTransformDecodeCapability::Unsupported
+        );
+
+        let oversized = ccitt_stream(
+            &[0],
+            65_536,
+            1,
+            Object::Dictionary(dictionary! {
+                "Columns" => 65_536, "Rows" => 1, "K" => 0,
+            }),
+        );
+        let (mut doc, _) = fixture(oversized, vec![content(b"/Scan Do")]);
+        let (_dir, native) = load(&mut doc);
+        assert_eq!(
+            native.pages()[0].image_invocations[0]
+                .metadata
+                .transform_decode,
+            NativeTransformDecodeCapability::Unsupported
+        );
+    }
+
+    #[test]
+    fn native_ccitt_rejects_truncation_and_trailing_nonzero_data() {
+        for encoded in [vec![0b1001_1000], vec![0b1001_1100, 0b1100_0000, 0x80]] {
+            let stream = ccitt_stream(
+                &encoded,
+                8,
+                2,
+                Object::Dictionary(dictionary! { "Columns" => 8, "Rows" => 2, "K" => 0 }),
+            );
+            let (mut doc, _) = fixture(stream, vec![content(b"/Scan Do")]);
+            let (_dir, native) = load(&mut doc);
+            let meta = &native.pages()[0].image_invocations[0].metadata;
+            assert_eq!(
+                meta.transform_decode,
+                NativeTransformDecodeCapability::Ccitt1
+            );
+            assert!(matches!(
+                native.decode_image(meta, 16),
+                Err(NativeExtractError::ImageDecode(_))
+            ));
         }
     }
 
@@ -759,6 +951,7 @@ pub struct NativeImageBinding {
 pub enum NativeTransformDecodeCapability {
     Dct8,
     Flate8,
+    Ccitt1,
     Unsupported,
 }
 
@@ -850,6 +1043,96 @@ struct NativeWalkState<'a> {
 
 const NATIVE_CONTENT_LIMIT: usize = 8 * 1024 * 1024;
 const NATIVE_IMAGE_LIMIT: u64 = 256 * 1024 * 1024;
+// Bounds the decoder's per-row transition vectors independently of the sample budget.
+const CCITT_MAX_DIMENSION: u32 = 65_535;
+
+struct CcittSampleCollector {
+    samples: Vec<u8>,
+    width: usize,
+    height: usize,
+    current_row_samples: usize,
+    completed_rows: usize,
+    invalid: bool,
+}
+
+impl CcittSampleCollector {
+    fn new(width: u32, height: u32, sample_count: usize) -> Self {
+        Self {
+            samples: Vec::with_capacity(sample_count),
+            width: width as usize,
+            height: height as usize,
+            current_row_samples: 0,
+            completed_rows: 0,
+            invalid: false,
+        }
+    }
+
+    fn push_pixels(&mut self, white: bool, count: usize) {
+        let Some(row_samples) = self.current_row_samples.checked_add(count) else {
+            self.invalid = true;
+            return;
+        };
+        let Some(total_samples) = self.samples.len().checked_add(count) else {
+            self.invalid = true;
+            return;
+        };
+        let Some(sample_budget) = self.width.checked_mul(self.height) else {
+            self.invalid = true;
+            return;
+        };
+        if self.invalid
+            || self.completed_rows >= self.height
+            || row_samples > self.width
+            || total_samples > sample_budget
+        {
+            self.invalid = true;
+            return;
+        }
+        self.samples
+            .resize(total_samples, if white { 255 } else { 0 });
+        self.current_row_samples = row_samples;
+    }
+
+    fn finish(self, expected: usize) -> std::result::Result<Vec<u8>, String> {
+        if self.invalid
+            || self.completed_rows != self.height
+            || self.current_row_samples != 0
+            || self.samples.len() != expected
+        {
+            return Err("CCITT decoder did not produce the exact declared image rows".into());
+        }
+        Ok(self.samples)
+    }
+}
+
+impl hayro_ccitt::Decoder for CcittSampleCollector {
+    fn push_pixel(&mut self, white: bool) {
+        self.push_pixels(white, 1);
+    }
+
+    fn push_pixel_chunk(&mut self, white: bool, chunk_count: u32) {
+        let Some(count) = usize::try_from(chunk_count)
+            .ok()
+            .and_then(|count| count.checked_mul(8))
+        else {
+            self.invalid = true;
+            return;
+        };
+        self.push_pixels(white, count);
+    }
+
+    fn next_line(&mut self) {
+        if self.invalid
+            || self.completed_rows >= self.height
+            || self.current_row_samples != self.width
+        {
+            self.invalid = true;
+            return;
+        }
+        self.completed_rows += 1;
+        self.current_row_samples = 0;
+    }
+}
 
 /// Loaded source PDF plus its page-complete preservation inventory.
 pub struct NativePdfDocument {
@@ -892,7 +1175,7 @@ impl NativePdfDocument {
         }
         if actual.transform_decode == NativeTransformDecodeCapability::Unsupported {
             return Err(NativeExtractError::UnsupportedDecode(format!(
-                "filters {:?}, bit depth {:?}, or PDF image semantics (CCITT is not implemented)",
+                "filters {:?}, bit depth {:?}, or PDF image semantics",
                 actual.filters, actual.bits_per_component
             )));
         }
@@ -939,6 +1222,17 @@ impl NativePdfDocument {
                     .read_image(&mut pixels)
                     .map_err(|e| NativeExtractError::ImageDecode(e.to_string()))?;
                 pixels
+            }
+            NativeTransformDecodeCapability::Ccitt1 => {
+                let settings = LopdfExtractor::strict_ccitt_settings(
+                    self.reader.document(),
+                    stream,
+                    actual.width,
+                    actual.height,
+                )
+                .map_err(NativeExtractError::ImageDecode)?;
+                LopdfExtractor::decode_ccitt_bounded(bytes, settings, expected)
+                    .map_err(NativeExtractError::ImageDecode)?
             }
             NativeTransformDecodeCapability::Unsupported => unreachable!("checked above"),
         };
@@ -1836,6 +2130,133 @@ impl LopdfExtractor {
         Ok(current)
     }
 
+    fn decode_ccitt_bounded(
+        bytes: &[u8],
+        settings: hayro_ccitt::DecodeSettings,
+        expected: usize,
+    ) -> std::result::Result<Vec<u8>, String> {
+        let mut collector = CcittSampleCollector::new(settings.columns, settings.rows, expected);
+        let mut context = hayro_ccitt::DecoderContext::new(settings);
+        let consumed = hayro_ccitt::decode(bytes, &mut collector, &mut context)
+            .map_err(|error| format!("invalid CCITT stream: {error}"))?;
+        // `consumed` is rounded up by the codec. Bits after the declared rows in that
+        // final byte are terminal padding; unexplained nonzero whole bytes are not.
+        if bytes
+            .get(consumed..)
+            .ok_or_else(|| "CCITT decoder consumed beyond the encoded stream".to_string())?
+            .iter()
+            .any(|byte| *byte != 0)
+        {
+            return Err("nonzero trailing bytes after CCITT image".into());
+        }
+        collector.finish(expected)
+    }
+
+    fn strict_ccitt_settings(
+        doc: &lopdf::Document,
+        stream: &lopdf::Stream,
+        width: u32,
+        height: u32,
+    ) -> std::result::Result<hayro_ccitt::DecodeSettings, String> {
+        const ALLOWED_KEYS: [&[u8]; 8] = [
+            b"Columns",
+            b"Rows",
+            b"K",
+            b"EndOfLine",
+            b"EncodedByteAlign",
+            b"EndOfBlock",
+            b"BlackIs1",
+            b"DamagedRowsBeforeError",
+        ];
+        let value = stream
+            .dict
+            .get(b"DecodeParms")
+            .map_err(|_| "CCITT DecodeParms dictionary is required")?;
+        let value = Self::resolve_object(doc, value).map_err(|error| error.to_string())?;
+        let params = value
+            .as_dict()
+            .map_err(|_| "CCITT DecodeParms must be one dictionary")?;
+        if params
+            .iter()
+            .any(|(key, _)| !ALLOWED_KEYS.contains(&key.as_slice()))
+        {
+            return Err("CCITT DecodeParms contains an unknown key".into());
+        }
+
+        let integer = |key: &[u8]| -> std::result::Result<i64, String> {
+            let value = params
+                .get(key)
+                .map_err(|_| format!("CCITT /{} is required", Self::canonical_pdf_name(key)))?;
+            match Self::resolve_object(doc, value).map_err(|error| error.to_string())? {
+                lopdf::Object::Integer(value) => Ok(*value),
+                _ => Err(format!(
+                    "CCITT /{} must be an integer",
+                    Self::canonical_pdf_name(key)
+                )),
+            }
+        };
+        let optional_integer = |key: &[u8], default: i64| -> std::result::Result<i64, String> {
+            let Ok(value) = params.get(key) else {
+                return Ok(default);
+            };
+            match Self::resolve_object(doc, value).map_err(|error| error.to_string())? {
+                lopdf::Object::Integer(value) => Ok(*value),
+                _ => Err(format!(
+                    "CCITT /{} must be an integer",
+                    Self::canonical_pdf_name(key)
+                )),
+            }
+        };
+        let boolean = |key: &[u8], default: bool| -> std::result::Result<bool, String> {
+            let Ok(value) = params.get(key) else {
+                return Ok(default);
+            };
+            match Self::resolve_object(doc, value).map_err(|error| error.to_string())? {
+                lopdf::Object::Boolean(value) => Ok(*value),
+                _ => Err(format!(
+                    "CCITT /{} must be a boolean",
+                    Self::canonical_pdf_name(key)
+                )),
+            }
+        };
+
+        let columns = u32::try_from(integer(b"Columns")?)
+            .ok()
+            .filter(|columns| *columns > 0 && *columns == width)
+            .ok_or_else(|| "CCITT /Columns must equal image /Width".to_string())?;
+        let rows = u32::try_from(integer(b"Rows")?)
+            .ok()
+            .filter(|rows| *rows > 0 && *rows == height)
+            .ok_or_else(|| "CCITT /Rows must equal image /Height".to_string())?;
+        if columns > CCITT_MAX_DIMENSION || rows > CCITT_MAX_DIMENSION {
+            return Err("CCITT dimensions exceed the bounded decoder working set".into());
+        }
+        let k = optional_integer(b"K", 0)?;
+        let encoding = if k < 0 {
+            hayro_ccitt::EncodingMode::Group4
+        } else if k == 0 {
+            hayro_ccitt::EncodingMode::Group3_1D
+        } else {
+            return Err("CCITT Group 3 mixed 2D encoding (K > 0) is unsupported".into());
+        };
+        if optional_integer(b"DamagedRowsBeforeError", 0)? != 0 {
+            return Err("CCITT /DamagedRowsBeforeError must be zero".into());
+        }
+        if boolean(b"EndOfLine", false)? || boolean(b"EncodedByteAlign", false)? {
+            return Err("CCITT EOL and byte-aligned row encodings are unsupported".into());
+        }
+
+        Ok(hayro_ccitt::DecodeSettings {
+            columns,
+            rows,
+            end_of_block: boolean(b"EndOfBlock", true)?,
+            end_of_line: false,
+            rows_are_byte_aligned: false,
+            encoding,
+            invert_black: boolean(b"BlackIs1", false)?,
+        })
+    }
+
     /// Strict zlib: bounded output, checksum/end marker required, no trailing data.
     fn inflate_bounded(bytes: &[u8], limit: usize) -> std::result::Result<Vec<u8>, String> {
         let mut decoder = flate2::Decompress::new(true);
@@ -2125,12 +2546,19 @@ impl LopdfExtractor {
             || stream
                 .dict
                 .get(b"ImageMask")
-                .is_ok_and(|value| !matches!(value, lopdf::Object::Boolean(false)))
-            || decode_params.as_ref().is_some_and(|value| !value.is_null());
+                .is_ok_and(|value| !matches!(value, lopdf::Object::Boolean(false)));
         let transform_decode = if unsupported_semantics {
             NativeTransformDecodeCapability::Unsupported
         } else {
-            Self::transform_decode_capability(&filters, bits_per_component, color_space.as_ref())
+            Self::transform_decode_capability(
+                doc,
+                stream,
+                (width, height),
+                &filters,
+                bits_per_component,
+                color_space.as_ref(),
+                decode_params.as_ref(),
+            )
         };
         let digest = Sha256::digest(&stream.content);
         Ok(NativeImageMetadata {
@@ -2148,10 +2576,24 @@ impl LopdfExtractor {
     }
 
     fn transform_decode_capability(
+        doc: &lopdf::Document,
+        stream: &lopdf::Stream,
+        dimensions: (u32, u32),
         filters: &[String],
         bits_per_component: Option<u8>,
         color_space: Option<&serde_json::Value>,
+        decode_params: Option<&serde_json::Value>,
     ) -> NativeTransformDecodeCapability {
+        if matches!(filters, [filter] if filter == "CCITTFaxDecode")
+            && bits_per_component == Some(1)
+            && color_space == Some(&serde_json::json!("/DeviceGray"))
+            && Self::strict_ccitt_settings(doc, stream, dimensions.0, dimensions.1).is_ok()
+        {
+            return NativeTransformDecodeCapability::Ccitt1;
+        }
+        if decode_params.is_some_and(|value| !value.is_null()) {
+            return NativeTransformDecodeCapability::Unsupported;
+        }
         let supported_color = matches!(
             color_space,
             Some(serde_json::Value::String(value))
@@ -4695,7 +5137,7 @@ mod tests {
         );
         assert_eq!(
             pages[2].image_invocations[0].metadata.transform_decode,
-            NativeTransformDecodeCapability::Unsupported
+            NativeTransformDecodeCapability::Ccitt1
         );
 
         let projected = pages[0].image_invocations[0]

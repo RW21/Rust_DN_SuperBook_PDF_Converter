@@ -270,7 +270,6 @@ impl GeometryManifest {
                     || !e.output_matrix.is_some_and(|[a, b, c, d, _, _]| {
                         a > 0.0 && d > 0.0 && b == 0.0 && c == 0.0
                     })
-                    || source.bits_per_component != Some(8)
                     || !matches!(
                         source
                             .color_space
@@ -295,6 +294,7 @@ impl GeometryManifest {
                         || f64::from(output.height) != height
                         || output.width < source.width
                         || output.height < source.height
+                        || !matches!(source.bits_per_component, Some(1 | 8))
                         || output.bits_per_component != Some(8)
                         || output
                             .color_space
@@ -306,7 +306,8 @@ impl GeometryManifest {
                             "deskew application does not match expanded RGBA8 layout",
                         ));
                     }
-                } else if source.width != output.width
+                } else if source.bits_per_component != Some(8)
+                    || source.width != output.width
                     || source.height != output.height
                     || source.bits_per_component != output.bits_per_component
                     || source.color_space != output.color_space
@@ -433,6 +434,9 @@ pub fn verify_geometry_bundle(directory: &Path) -> Result<GeometryManifest, Geom
                 }
                 [f] if f == "DCTDecode" => {
                     crate::image_extract::NativeTransformDecodeCapability::Dct8
+                }
+                [f] if f == "CCITTFaxDecode" => {
+                    crate::image_extract::NativeTransformDecodeCapability::Ccitt1
                 }
                 _ => crate::image_extract::NativeTransformDecodeCapability::Unsupported,
             };
@@ -802,6 +806,33 @@ mod tests {
             assert!(page.output.decoded_pixel_sha256.is_some());
         }
     }
+
+    #[test]
+    fn published_ccitt_deskew_verifies_against_retained_bilevel_source() {
+        let mut grayscale = crate::geometry_analysis::tests::skewed_edge(2.0).into_luma8();
+        for sample in grayscale.iter_mut() {
+            *sample = if *sample < 255 { 0 } else { 255 };
+        }
+        let image = image::DynamicImage::ImageLuma8(grayscale);
+        let (dir, native) = crate::geometry_analysis::tests::ccitt_fixture(
+            &[b"480 0 0 640 60 80 cm /Scan Do"],
+            &image,
+        );
+        let pipeline = PdfPipeline::new(PipelineConfig::geometry_only(
+            GeometryAction::Off,
+            GeometryAction::Apply,
+        ));
+        let published =
+            process_geometry(&pipeline, native.source_path(), &dir.path().join("bundle")).unwrap();
+        let manifest = verify_geometry_bundle(&published.directory).unwrap();
+        let page = &manifest.pages[0];
+        assert_eq!(page.evidence.deskew.decision, TransformDecision::Applied);
+        assert_eq!(page.source_images[0].bits_per_component, Some(1));
+        assert_eq!(page.output_images[0].bits_per_component, Some(8));
+        assert!(page.evidence.deskew_pixels_changed);
+        assert!(page.output.decoded_pixel_sha256.is_some());
+    }
+
     #[test]
     fn rejected_clipping_publishes_unchanged_review_not_applied() {
         let image = crate::geometry_analysis::tests::skewed_edge(2.0);

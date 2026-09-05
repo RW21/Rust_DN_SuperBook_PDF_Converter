@@ -19,8 +19,24 @@ rasters share a 512 MiB default budget (or PipelineConfig.max_memory_mb when set
 is not a cap on parser/codec/transient working memory. Budget exhaustion aborts the new
 bundle rather than risking unbounded retention across a whole book.
 
-A 180-degree correction is an exact native sample permutation. Approved deskew uses the
-existing Lanczos-3 expanded RGBA8 transform. Expanded output is centered on the original
+Native decoding additionally accepts one-bit `/DeviceGray` `/CCITTFaxDecode` images only
+when strict explicit `/Columns` and `/Rows` match the image dimensions. `K = 0` Group 3
+one-dimensional and `K < 0` Group 4 are supported by the exact-pinned decoder; mixed
+Group 3 two-dimensional `K > 0`, damaged-row tolerance, unknown or malformed parameters,
+EOL/byte-aligned-row variants, excessive dimensions, and other image semantics fail closed.
+The dimension cap bounds decoder transition state independently of the sample budget.
+Short output, overflow, and unexplained nonzero trailing whole bytes are rejected; bits
+after the exact declared row count in the codec's final consumed byte are terminal padding.
+Decoding expands bilevel samples to Gray8 only for
+analysis. Unchanged/report output continues to reuse the original encoded CCITT stream
+byte-for-byte.
+
+A 180-degree correction is an exact native sample permutation. Automatic 180-degree
+application to a one-bit source remains rejected and review-required until the writer can
+publish a lossless bilevel replacement without changing bit depth; analysis/reporting is
+still allowed. Approved deskew uses the existing Lanczos-3 expanded RGBA8 transform, so a
+one-bit source may become RGBA8 only when the manifest records and independently verifies
+an actually applied interpolated deskew. Expanded output is centered on the original
 scan frame at the original physical pixel scale, without resizing or raster cropping.
 The actual f32 PDF placement matrix is checked against MediaBox/CropBox intersection.
 A conservative bound around every nonwhite/nontransparent pixel must lie fully inside

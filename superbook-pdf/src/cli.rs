@@ -7,6 +7,8 @@ use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::deskew::RotationConfidenceThreshold;
+
 /// Exit codes for the CLI
 ///
 /// These codes follow standard Unix conventions and provide
@@ -549,6 +551,10 @@ pub struct ConvertArgs {
     /// Override the geometry action for 180-degree rotation
     #[arg(long, value_enum, requires = "geometry_only")]
     pub rotation_action: Option<GeometryAction>,
+
+    /// Minimum confidence required to apply a proposed 180-degree rotation
+    #[arg(long, requires = "geometry_only")]
+    pub rotation_min_confidence: Option<RotationConfidenceThreshold>,
 
     /// Override the geometry action for deskew correction
     #[arg(long, value_enum, requires = "geometry_only")]

@@ -28,6 +28,10 @@ use std::time::Instant;
 use thiserror::Error;
 
 use crate::cli::{ConvertArgs, GeometryAction};
+use crate::deskew::{
+    RotationAnalysisOptions, RotationConfidenceThreshold, RotationEvidence, RotationReason,
+};
+use crate::transform_manifest::{RotationTransform, TransformDecision};
 
 // ============================================================
 // Memory Management Utilities (Phase 3 optimization)
@@ -234,6 +238,9 @@ pub struct PipelineConfig {
     /// Action for 180-degree rotation analysis/application
     #[serde(default = "default_geometry_action_apply")]
     pub rotation_action: GeometryAction,
+    /// Minimum confidence required to apply a proposed 180-degree rotation
+    #[serde(default)]
+    pub rotation_min_confidence: RotationConfidenceThreshold,
     /// Whether the rotation action was explicitly resolved or configured
     #[doc(hidden)]
     #[serde(default, skip_serializing_if = "is_false")]
@@ -333,6 +340,7 @@ impl Default for PipelineConfig {
         Self {
             geometry_only: false,
             rotation_action: GeometryAction::Apply,
+            rotation_min_confidence: RotationConfidenceThreshold::default(),
             rotation_action_configured: false,
             deskew_action: GeometryAction::Apply,
             deskew_action_configured: false,
@@ -383,6 +391,7 @@ impl PipelineConfig {
         let mut config = Self {
             geometry_only: args.geometry_only,
             rotation_action: args.effective_rotation_action(),
+            rotation_min_confidence: args.rotation_min_confidence.unwrap_or_default(),
             rotation_action_configured: true,
             deskew_action: args.effective_deskew_action(),
             deskew_action_configured: true,
@@ -506,6 +515,14 @@ impl PipelineConfig {
             self.deskew_action = GeometryAction::Report;
         }
     }
+
+    fn rotation_stage_enabled(&self) -> bool {
+        self.rotation_action != GeometryAction::Off && (self.geometry_only || self.deskew)
+    }
+
+    fn deskew_stage_enabled(&self) -> bool {
+        self.deskew_action != GeometryAction::Off && (self.geometry_only || self.deskew)
+    }
 }
 
 /// Result of pipeline processing
@@ -525,6 +542,65 @@ pub struct PipelineResult {
     pub output_size: u64,
     /// Transform manifest JSONL path, present only when the manifest was published.
     pub transform_manifest_path: Option<PathBuf>,
+}
+
+/// Auditable policy result derived from one rotation analysis.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RotationPolicyOutcome {
+    /// Zero-based physical page index supplied by the coordinator.
+    pub page_index: usize,
+    /// Manifest-ready transform evidence and decision.
+    pub transform: RotationTransform,
+    /// Whether decoded pixels should be permuted by 180 degrees.
+    pub should_apply: bool,
+    /// Whether a human should review this page.
+    pub review_required: bool,
+}
+
+impl RotationPolicyOutcome {
+    fn from_evidence(
+        page_index: usize,
+        evidence: &RotationEvidence,
+        action: GeometryAction,
+        threshold: RotationConfidenceThreshold,
+    ) -> Result<Self, PipelineError> {
+        let is_upright = evidence.proposed_degrees() == 0
+            && evidence.reason() == RotationReason::UprightEvidence
+            && !evidence.ambiguity_guard();
+        let approved = evidence.is_auto_applicable(threshold.get());
+
+        let (decision, should_apply, review_required) = match action {
+            GeometryAction::Off => (TransformDecision::Unchanged, false, false),
+            GeometryAction::Report if approved => (TransformDecision::Proposed, false, true),
+            GeometryAction::Apply if approved => (TransformDecision::Proposed, true, false),
+            GeometryAction::Report | GeometryAction::Apply if is_upright => {
+                (TransformDecision::Unchanged, false, false)
+            }
+            GeometryAction::Report | GeometryAction::Apply => {
+                (TransformDecision::Rejected, false, true)
+            }
+        };
+
+        let transform = RotationTransform::new(
+            evidence.proposed_degrees() as i16,
+            Some(evidence.score()),
+            evidence.confidence(),
+            decision,
+            evidence.reason().to_string(),
+        )?;
+
+        Ok(Self {
+            page_index,
+            transform,
+            should_apply,
+            review_required,
+        })
+    }
+
+    fn mark_applied(&mut self) {
+        debug_assert!(self.should_apply);
+        self.transform.decision = TransformDecision::Applied;
+    }
 }
 
 impl PipelineResult {
@@ -592,6 +668,34 @@ impl PdfPipeline {
     /// Get the pipeline configuration
     pub fn config(&self) -> &PipelineConfig {
         &self.config
+    }
+
+    /// Analyze one decoded page and apply the configured report/apply policy.
+    ///
+    /// `None` means rotation analysis is disabled. The returned outcome is
+    /// manifest-ready and does not itself modify the image.
+    pub fn analyze_rotation(
+        &self,
+        page_index: usize,
+        image_path: &Path,
+    ) -> Result<Option<RotationPolicyOutcome>, PipelineError> {
+        if self.config.rotation_action == GeometryAction::Off {
+            return Ok(None);
+        }
+
+        let options = RotationAnalysisOptions::builder()
+            .minimum_apply_confidence(self.config.rotation_min_confidence.get())
+            .build()
+            .map_err(|error| PipelineError::ImageProcessingFailed(error.to_string()))?;
+        let evidence = crate::ImageProcDeskewer::analyze_rotation(image_path, &options)
+            .map_err(|error| PipelineError::ImageProcessingFailed(error.to_string()))?;
+        RotationPolicyOutcome::from_evidence(
+            page_index,
+            &evidence,
+            self.config.rotation_action,
+            self.config.rotation_min_confidence,
+        )
+        .map(Some)
     }
 
     /// Reject pipeline modes whose safe writer path is not implemented yet.
@@ -736,14 +840,13 @@ impl PdfPipeline {
                 self.step_normalize(&work_dir, &current_images, &blank_pages, progress)?;
         }
 
-        // Step 4.5: 180-degree rotation detection & correction (before deskew)
-        if self.config.deskew {
-            current_images =
-                self.step_rotation_detect(&work_dir, &current_images, &blank_pages, progress)?;
+        // Step 4.5: 180-degree rotation analysis/application (before deskew)
+        if self.config.rotation_stage_enabled() {
+            current_images = self.step_rotation_detect(&work_dir, &current_images, progress)?;
         }
 
         // Step 5: Deskew (if enabled) - C# does deskew AFTER normalization
-        if self.config.deskew {
+        if self.config.deskew_stage_enabled() {
             current_images =
                 self.step_deskew(&work_dir, &current_images, &blank_pages, progress)?;
         }
@@ -878,74 +981,68 @@ impl PdfPipeline {
         results
     }
 
-    /// Step 4.5: 180-degree rotation detection and correction
-    ///
-    /// Detects pages that are upside down by comparing ink density in
-    /// the top vs bottom of the page, and rotates them 180 degrees.
+    /// Step 4.5: conservative 180-degree rotation analysis and policy application.
     fn step_rotation_detect<P: ProgressCallback>(
         &self,
         work_dir: &Path,
         images: &[PathBuf],
-        blank_pages: &[bool],
         progress: &P,
     ) -> Result<Vec<PathBuf>, PipelineError> {
-        progress.on_step_start("Detecting page rotation...");
+        progress.on_step_start("Analyzing page rotation...");
         let rotated_dir = work_dir.join("rotation_corrected");
         std::fs::create_dir_all(&rotated_dir)?;
 
         let output_paths: Vec<PathBuf> = images
             .iter()
             .enumerate()
-            .map(|(idx, img)| {
-                let name = img
-                    .file_name()
-                    .map(|n| n.to_os_string())
-                    .unwrap_or_else(|| std::ffi::OsString::from(format!("page_{:04}.png", idx)));
+            .map(|(idx, image)| {
+                let name = image.file_name().map_or_else(
+                    || std::ffi::OsString::from(format!("page_{idx:04}.png")),
+                    std::ffi::OsStr::to_os_string,
+                );
                 rotated_dir.join(name)
             })
             .collect();
 
-        let corrected_count = AtomicUsize::new(0);
-
-        let results: Vec<PathBuf> = images
+        let results: Result<Vec<(PathBuf, RotationPolicyOutcome)>, PipelineError> = images
             .par_iter()
             .zip(output_paths.par_iter())
             .enumerate()
-            .map(|(idx, (img_path, output_path))| {
-                // Skip blank pages
-                if blank_pages.get(idx).copied().unwrap_or(false) {
-                    std::fs::copy(img_path, output_path).ok();
-                    return output_path.clone();
-                }
+            .map(|(page_index, (image_path, output_path))| {
+                let mut outcome =
+                    self.analyze_rotation(page_index, image_path)?
+                        .ok_or_else(|| {
+                            PipelineError::ImageProcessingFailed(
+                                "rotation stage was invoked while rotation analysis was disabled"
+                                    .to_string(),
+                            )
+                        })?;
 
-                // Check if upside down
-                match crate::ImageProcDeskewer::detect_upside_down(img_path) {
-                    Ok(true) => {
-                        // Rotate 180 degrees
-                        match crate::ImageProcDeskewer::correct_upside_down(img_path, output_path) {
-                            Ok(()) => {
-                                corrected_count.fetch_add(1, Ordering::Relaxed);
-                            }
-                            Err(_) => {
-                                std::fs::copy(img_path, output_path).ok();
-                            }
-                        }
-                    }
-                    _ => {
-                        // Not upside down or detection failed — keep as is
-                        std::fs::copy(img_path, output_path).ok();
-                    }
+                if outcome.should_apply {
+                    crate::ImageProcDeskewer::correct_upside_down(image_path, output_path)
+                        .map_err(|error| PipelineError::ImageProcessingFailed(error.to_string()))?;
+                    outcome.mark_applied();
+                } else {
+                    std::fs::copy(image_path, output_path)?;
                 }
-                output_path.clone()
+                Ok((output_path.clone(), outcome))
             })
             .collect();
 
-        let corrected = corrected_count.load(Ordering::Relaxed);
+        let results = results?;
+        let applied = results
+            .iter()
+            .filter(|(_, outcome)| outcome.should_apply)
+            .count();
+        let review_required = results
+            .iter()
+            .filter(|(_, outcome)| outcome.review_required)
+            .count();
         progress.on_step_complete(
-            "Rotation detection",
-            &format!("{} pages corrected (180°)", corrected),
+            "Rotation analysis",
+            &format!("{applied} pages corrected (180°), {review_required} require review"),
         );
-        Ok(results)
+        Ok(results.into_iter().map(|(path, _)| path).collect())
     }
 
     /// Step 3: Deskew correction (with blank page skip + confidence filter)
@@ -978,6 +1075,7 @@ impl PdfPipeline {
 
         let skipped = AtomicUsize::new(0);
         let low_confidence = AtomicUsize::new(0);
+        let reported = AtomicUsize::new(0);
 
         let results: Vec<PathBuf> = images
             .par_iter()
@@ -1000,8 +1098,12 @@ impl PdfPipeline {
                             // Low confidence: skip correction
                             std::fs::copy(img_path, output_path).ok();
                             low_confidence.fetch_add(1, Ordering::Relaxed);
+                        } else if self.config.deskew_action == GeometryAction::Report {
+                            // Report mode must never alter decoded pixels.
+                            std::fs::copy(img_path, output_path).ok();
+                            reported.fetch_add(1, Ordering::Relaxed);
                         } else {
-                            // Apply deskew correction
+                            // Apply mode only.
                             match crate::ImageProcDeskewer::correct_skew(
                                 img_path,
                                 output_path,
@@ -1024,12 +1126,13 @@ impl PdfPipeline {
 
         let skipped_count = skipped.load(Ordering::Relaxed);
         let low_conf_count = low_confidence.load(Ordering::Relaxed);
-        let corrected = results.len() - skipped_count - low_conf_count;
+        let reported_count = reported.load(Ordering::Relaxed);
+        let corrected = results.len() - skipped_count - low_conf_count - reported_count;
         progress.on_step_complete(
             "Deskew",
             &format!(
-                "{} corrected, {} skipped (blank), {} skipped (low confidence)",
-                corrected, skipped_count, low_conf_count
+                "{} corrected, {} reported, {} skipped (blank), {} skipped (low confidence)",
+                corrected, reported_count, skipped_count, low_conf_count
             ),
         );
         Ok(results)
@@ -1851,6 +1954,8 @@ impl PdfPipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::{DynamicImage, GenericImageView, GrayImage, Luma};
+    use tempfile::tempdir;
 
     // ============ PipelineConfig Tests ============
 
@@ -1861,6 +1966,7 @@ mod tests {
 
         assert_eq!(config.dpi, 300);
         assert!(config.deskew);
+        assert_eq!(config.rotation_min_confidence.get(), 0.90);
         assert_eq!(config.margin_trim, 0.7);
         assert!(config.upscale);
         assert!(config.gpu);
@@ -1926,6 +2032,223 @@ mod tests {
 
         assert_eq!(pipeline.config().rotation_action, GeometryAction::Apply);
         assert_eq!(pipeline.config().deskew_action, GeometryAction::Apply);
+    }
+
+    fn rotation_evidence(
+        proposed_degrees: u16,
+        score: f64,
+        confidence: f64,
+        reason: RotationReason,
+        ambiguity_guard: bool,
+    ) -> RotationEvidence {
+        RotationEvidence::try_new(
+            proposed_degrees,
+            score,
+            confidence,
+            reason,
+            ambiguity_guard,
+            crate::RotationMetrics::default(),
+        )
+        .unwrap()
+    }
+
+    fn synthetic_rotation_page() -> DynamicImage {
+        let mut image = GrayImage::from_pixel(600, 800, Luma([255]));
+        let rows = [
+            45, 56, 67, 78, 89, 100, 111, 122, 133, 144, 190, 220, 250, 270, 650, 700,
+        ];
+        for (line, y) in rows.into_iter().enumerate() {
+            for glyph in 0..20 {
+                let x = 50 + glyph * 25;
+                let width = 6 + ((line + glyph as usize) % 3) as u32;
+                for yy in y..y + 6 {
+                    for xx in x..x + width {
+                        image.put_pixel(xx, yy, Luma([0]));
+                    }
+                }
+            }
+        }
+        DynamicImage::ImageLuma8(image)
+    }
+
+    fn rotation_pipeline(action: GeometryAction) -> PdfPipeline {
+        PdfPipeline::new(PipelineConfig {
+            rotation_action: action,
+            rotation_action_configured: true,
+            rotation_min_confidence: RotationConfidenceThreshold::default(),
+            ..PipelineConfig::default()
+        })
+    }
+
+    #[test]
+    fn rotation_policy_report_never_applies_an_approved_proposal() {
+        let evidence = rotation_evidence(180, 0.8, 0.95, RotationReason::UpsideDownEvidence, false);
+        let outcome = RotationPolicyOutcome::from_evidence(
+            7,
+            &evidence,
+            GeometryAction::Report,
+            RotationConfidenceThreshold::default(),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.page_index, 7);
+
+        assert_eq!(outcome.transform.decision, TransformDecision::Proposed);
+        assert!(!outcome.should_apply);
+        assert!(outcome.review_required);
+    }
+
+    #[test]
+    fn rotation_policy_apply_requires_confidence_and_no_ambiguity() {
+        let threshold = RotationConfidenceThreshold::new(0.90).unwrap();
+        let approved = rotation_evidence(180, 0.8, 0.95, RotationReason::UpsideDownEvidence, false);
+        let low_confidence =
+            rotation_evidence(180, 0.8, 0.89, RotationReason::UpsideDownEvidence, false);
+        let ambiguous = rotation_evidence(180, 0.8, 0.99, RotationReason::BandDisagreement, true);
+
+        let mut applied =
+            RotationPolicyOutcome::from_evidence(3, &approved, GeometryAction::Apply, threshold)
+                .unwrap();
+        assert_eq!(applied.transform.decision, TransformDecision::Proposed);
+        assert!(applied.should_apply);
+        assert!(!applied.review_required);
+        applied.mark_applied();
+        assert_eq!(applied.transform.decision, TransformDecision::Applied);
+
+        for evidence in [&low_confidence, &ambiguous] {
+            let rejected =
+                RotationPolicyOutcome::from_evidence(3, evidence, GeometryAction::Apply, threshold)
+                    .unwrap();
+            assert_eq!(rejected.transform.decision, TransformDecision::Rejected);
+            assert!(!rejected.should_apply);
+            assert!(rejected.review_required);
+        }
+    }
+
+    #[test]
+    fn disabled_rotation_does_not_read_the_image() {
+        let pipeline = PdfPipeline::new(PipelineConfig {
+            rotation_action: GeometryAction::Off,
+            rotation_action_configured: true,
+            ..PipelineConfig::default()
+        });
+
+        assert!(pipeline
+            .analyze_rotation(0, Path::new("/path/that/does/not/exist.png"))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn geometry_stage_gates_keep_rotation_and_deskew_independent() {
+        let rotation_only = PdfPipeline::new(PipelineConfig::geometry_only(
+            GeometryAction::Report,
+            GeometryAction::Off,
+        ));
+        assert!(rotation_only.config().rotation_stage_enabled());
+        assert!(!rotation_only.config().deskew_stage_enabled());
+
+        let deskew_only = PdfPipeline::new(PipelineConfig::geometry_only(
+            GeometryAction::Off,
+            GeometryAction::Report,
+        ));
+        assert!(!deskew_only.config().rotation_stage_enabled());
+        assert!(deskew_only.config().deskew_stage_enabled());
+    }
+
+    #[test]
+    fn rotation_report_stage_preserves_encoded_bytes_and_input_order() {
+        let temp = tempdir().unwrap();
+        let source_dir = temp.path().join("source");
+        std::fs::create_dir(&source_dir).unwrap();
+        let first = source_dir.join("z-page.png");
+        let second = source_dir.join("a-page.png");
+        let upright = synthetic_rotation_page();
+        upright.save(&first).unwrap();
+        crate::ImageProcDeskewer::rotate_180_exact(&upright)
+            .save(&second)
+            .unwrap();
+        let source_bytes = [
+            std::fs::read(&first).unwrap(),
+            std::fs::read(&second).unwrap(),
+        ];
+
+        let outputs = rotation_pipeline(GeometryAction::Report)
+            .step_rotation_detect(
+                temp.path(),
+                &[first.clone(), second.clone()],
+                &SilentProgress,
+            )
+            .unwrap();
+
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0].file_name(), first.file_name());
+        assert_eq!(outputs[1].file_name(), second.file_name());
+        assert_eq!(std::fs::read(&outputs[0]).unwrap(), source_bytes[0]);
+        assert_eq!(std::fs::read(&outputs[1]).unwrap(), source_bytes[1]);
+    }
+
+    #[test]
+    fn rotation_apply_stage_publishes_exact_half_turn() {
+        let temp = tempdir().unwrap();
+        let input = temp.path().join("upside-down.png");
+        let upright = synthetic_rotation_page();
+        crate::ImageProcDeskewer::rotate_180_exact(&upright)
+            .save(&input)
+            .unwrap();
+        let pipeline = rotation_pipeline(GeometryAction::Apply);
+        let proposal = pipeline.analyze_rotation(0, &input).unwrap().unwrap();
+        assert!(proposal.should_apply);
+        assert_eq!(proposal.transform.decision, TransformDecision::Proposed);
+
+        let outputs = pipeline
+            .step_rotation_detect(temp.path(), &[input], &SilentProgress)
+            .unwrap();
+        let output = image::open(&outputs[0]).unwrap();
+
+        assert_eq!(output.color(), upright.color());
+        assert_eq!(output.dimensions(), upright.dimensions());
+        assert_eq!(output.as_bytes(), upright.as_bytes());
+    }
+
+    #[test]
+    fn rotation_stage_propagates_analysis_copy_and_transform_errors() {
+        let analysis_temp = tempdir().unwrap();
+        let invalid = analysis_temp.path().join("invalid.png");
+        std::fs::write(&invalid, b"not an image").unwrap();
+        assert!(rotation_pipeline(GeometryAction::Report)
+            .step_rotation_detect(analysis_temp.path(), &[invalid], &SilentProgress)
+            .is_err());
+
+        let copy_temp = tempdir().unwrap();
+        let copy_input = copy_temp.path().join("upright.png");
+        synthetic_rotation_page().save(&copy_input).unwrap();
+        let copy_output = copy_temp.path().join("rotation_corrected/upright.png");
+        std::fs::create_dir_all(&copy_output).unwrap();
+        assert!(rotation_pipeline(GeometryAction::Report)
+            .step_rotation_detect(copy_temp.path(), &[copy_input], &SilentProgress)
+            .is_err());
+
+        let transform_temp = tempdir().unwrap();
+        let transform_input = transform_temp.path().join("upside-down.png");
+        crate::ImageProcDeskewer::rotate_180_exact(&synthetic_rotation_page())
+            .save(&transform_input)
+            .unwrap();
+        let transform_pipeline = rotation_pipeline(GeometryAction::Apply);
+        assert!(
+            transform_pipeline
+                .analyze_rotation(0, &transform_input)
+                .unwrap()
+                .unwrap()
+                .should_apply
+        );
+        let transform_output = transform_temp
+            .path()
+            .join("rotation_corrected/upside-down.png");
+        std::fs::create_dir_all(&transform_output).unwrap();
+        assert!(transform_pipeline
+            .step_rotation_detect(transform_temp.path(), &[transform_input], &SilentProgress)
+            .is_err());
     }
 
     #[test]

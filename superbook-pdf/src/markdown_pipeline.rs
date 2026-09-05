@@ -574,21 +574,15 @@ impl MarkdownPipeline {
                 .unwrap_or_else(|| format!("page_{:04}.png", idx).into());
             let output_path = output_dir.join(&name);
 
-            match crate::ImageProcDeskewer::detect_upside_down(img_path) {
-                Ok(true) => {
-                    match crate::ImageProcDeskewer::correct_upside_down(img_path, &output_path) {
-                        Ok(()) => {
-                            corrected += 1;
-                            progress.on_debug(&format!("page {} を180度回転補正", idx));
-                        }
-                        Err(_) => {
-                            std::fs::copy(img_path, &output_path)?;
-                        }
-                    }
-                }
-                _ => {
-                    std::fs::copy(img_path, &output_path)?;
-                }
+            let should_rotate = crate::ImageProcDeskewer::detect_upside_down(img_path)
+                .map_err(|error| PipelineError::ImageProcessingFailed(error.to_string()))?;
+            if should_rotate {
+                crate::ImageProcDeskewer::correct_upside_down(img_path, &output_path)
+                    .map_err(|error| PipelineError::ImageProcessingFailed(error.to_string()))?;
+                corrected += 1;
+                progress.on_debug(&format!("page {} を180度回転補正", idx));
+            } else {
+                std::fs::copy(img_path, &output_path)?;
             }
             output_paths.push(output_path);
         }

@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 use crate::cli::{GeometryAction, GeometryModeAction};
-use crate::PipelineConfig;
+use crate::{PipelineConfig, RotationConfidenceThreshold};
 
 /// Configuration file errors
 #[derive(Debug, Error)]
@@ -79,6 +79,10 @@ pub struct ProcessingConfig {
     /// Override the common action for 180-degree rotation
     #[serde(default)]
     pub rotation_action: Option<GeometryAction>,
+
+    /// Minimum confidence required to apply a proposed 180-degree rotation
+    #[serde(default)]
+    pub rotation_min_confidence: Option<RotationConfidenceThreshold>,
 
     /// Override the common action for deskew correction
     #[serde(default)]
@@ -401,6 +405,10 @@ impl Config {
             }
         }
 
+        if let Some(threshold) = self.processing.rotation_min_confidence {
+            config.rotation_min_confidence = threshold;
+        }
+
         config.enforce_geometry_only_constraints();
 
         config
@@ -496,6 +504,9 @@ impl Config {
                 config.deskew_action_configured = true;
             }
         }
+        if let Some(threshold) = cli.rotation_min_confidence {
+            config.rotation_min_confidence = threshold;
+        }
 
         config.enforce_geometry_only_constraints();
 
@@ -520,6 +531,7 @@ pub struct CliOverrides {
     pub geometry_only: Option<bool>,
     pub geometry_action: Option<GeometryModeAction>,
     pub rotation_action: Option<GeometryAction>,
+    pub rotation_min_confidence: Option<RotationConfidenceThreshold>,
     pub deskew_action: Option<GeometryAction>,
     pub dpi: Option<u32>,
     pub deskew: Option<bool>,
@@ -862,6 +874,45 @@ deskew_action = "report"
 
         assert_eq!(pipeline.rotation_action, GeometryAction::Report);
         assert_eq!(pipeline.deskew_action, GeometryAction::Off);
+    }
+
+    #[test]
+    fn test_rotation_confidence_config_default_and_cli_precedence() {
+        let config = Config::from_toml(
+            r#"
+[processing]
+geometry_only = true
+rotation_min_confidence = 0.95
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.to_pipeline_config().rotation_min_confidence.get(),
+            0.95
+        );
+
+        let omitted = config.merge_with_cli(&CliOverrides::default());
+        assert_eq!(omitted.rotation_min_confidence.get(), 0.95);
+
+        let cli = CliOverrides {
+            rotation_min_confidence: Some(
+                "0.97"
+                    .parse::<crate::RotationConfidenceThreshold>()
+                    .unwrap(),
+            ),
+            ..CliOverrides::default()
+        };
+        let overridden = config.merge_with_cli(&cli);
+        assert_eq!(overridden.rotation_min_confidence.get(), 0.97);
+    }
+
+    #[test]
+    fn test_rotation_confidence_config_rejects_invalid_values() {
+        for value in ["-0.1", "1.1", "nan", "inf"] {
+            let toml =
+                format!("[processing]\ngeometry_only = true\nrotation_min_confidence = {value}\n");
+            assert!(Config::from_toml(&toml).is_err(), "{value}");
+        }
     }
 
     #[test]

@@ -172,7 +172,7 @@ pub use config::{
 pub use deskew::{
     DeskewAlgorithm, DeskewError, DeskewOptions, DeskewOptionsBuilder, DeskewResult,
     ImageProcDeskewer, QualityMode, RotationAnalysisOptions, RotationAnalysisOptionsBuilder,
-    RotationEvidence, RotationMetrics, RotationReason, SkewDetection,
+    RotationConfidenceThreshold, RotationEvidence, RotationMetrics, RotationReason, SkewDetection,
     DEFAULT_ROTATION_BORDER_CROP_FRACTION, DEFAULT_ROTATION_MAXIMUM_DENSE_ROW_FRACTION,
     DEFAULT_ROTATION_MAXIMUM_ILLUSTRATION_INK_RATIO,
     DEFAULT_ROTATION_MAXIMUM_LARGEST_COMPONENT_SHARE, DEFAULT_ROTATION_MINIMUM_APPLY_CONFIDENCE,
@@ -251,7 +251,7 @@ pub use parallel::{
 };
 pub use pipeline::{
     calculate_optimal_chunk_size, process_in_chunks, PdfPipeline, PipelineConfig, PipelineError,
-    PipelineResult, ProcessingContext, ProgressCallback, SilentProgress,
+    PipelineResult, ProcessingContext, ProgressCallback, RotationPolicyOutcome, SilentProgress,
 };
 pub use progress::{build_progress_bar, OutputMode, ProcessingStage, ProgressTracker};
 pub use vertical_detect::{

@@ -794,8 +794,7 @@ fn test_config_option_short_in_help() {
 }
 
 #[test]
-fn test_config_nonexistent_file_warning() {
-    // Nonexistent config file should show warning but continue with defaults
+fn test_explicit_missing_config_is_fatal() {
     superbook_cmd()
         .args([
             "convert",
@@ -807,9 +806,24 @@ fn test_config_nonexistent_file_warning() {
             "/nonexistent/config.toml",
         ])
         .assert()
-        .success()
-        .stderr(predicate::str::contains("Warning"))
+        .failure()
         .stderr(predicate::str::contains("Failed to load config file"));
+}
+
+#[test]
+fn test_implicit_invalid_config_retains_legacy_default_fallback() {
+    let temp_dir = TempDir::new().unwrap();
+    std::fs::write(temp_dir.path().join("superbook.toml"), "not valid toml = [").unwrap();
+    let input = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample.pdf");
+
+    superbook_cmd()
+        .current_dir(temp_dir.path())
+        .arg("convert")
+        .arg(input)
+        .args(["-o", "/tmp/out", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("DPI: 300"));
 }
 
 #[test]
@@ -874,4 +888,112 @@ dpi = 600
         .success()
         // CLI value (450) should override config (600)
         .stdout(predicate::str::contains("DPI: 450"));
+}
+
+#[test]
+fn test_rotation_min_confidence_cli_contract() {
+    superbook_cmd()
+        .args([
+            "convert",
+            "tests/fixtures/sample.pdf",
+            "--geometry-only",
+            "--rotation-min-confidence",
+            "0.97",
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Rotation minimum confidence: 0.97",
+        ));
+
+    superbook_cmd()
+        .args([
+            "convert",
+            "tests/fixtures/sample.pdf",
+            "--rotation-min-confidence",
+            "0.97",
+            "--dry-run",
+        ])
+        .assert()
+        .failure();
+
+    for invalid in ["NaN", "inf", "-0.1", "1.1"] {
+        superbook_cmd()
+            .args([
+                "convert",
+                "tests/fixtures/sample.pdf",
+                "--geometry-only",
+                "--rotation-min-confidence",
+                invalid,
+                "--dry-run",
+            ])
+            .assert()
+            .failure();
+    }
+}
+
+#[test]
+fn test_rotation_min_confidence_config_and_cli_precedence() {
+    let temp_dir = TempDir::new().unwrap();
+    let config_path = temp_dir.path().join("rotation.toml");
+    std::fs::write(
+        &config_path,
+        "[processing]\ngeometry_only = true\nrotation_min_confidence = 0.95\n",
+    )
+    .unwrap();
+
+    superbook_cmd()
+        .args([
+            "convert",
+            "tests/fixtures/sample.pdf",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Rotation minimum confidence: 0.95",
+        ));
+
+    superbook_cmd()
+        .args([
+            "convert",
+            "tests/fixtures/sample.pdf",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--geometry-only",
+            "--rotation-min-confidence",
+            "0.98",
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Rotation minimum confidence: 0.98",
+        ));
+}
+
+#[test]
+fn test_explicit_invalid_config_is_fatal() {
+    let temp_dir = TempDir::new().unwrap();
+    let config_path = temp_dir.path().join("invalid.toml");
+    std::fs::write(
+        &config_path,
+        "[processing]\ngeometry_only = true\nrotation_min_confidence = 1.1\n",
+    )
+    .unwrap();
+
+    superbook_cmd()
+        .args([
+            "convert",
+            "tests/fixtures/sample.pdf",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--dry-run",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Failed to load config file"));
 }

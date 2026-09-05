@@ -150,13 +150,9 @@ fn run_convert(args: &ConvertArgs, matches: &ArgMatches) -> Result<(), Box<dyn s
 
     // Load config file if specified, otherwise use default
     let file_config = match &args.config {
-        Some(config_path) => match Config::load_from_path(config_path) {
-            Ok(cfg) => cfg,
-            Err(e) => {
-                eprintln!("Warning: Failed to load config file: {}", e);
-                Config::default()
-            }
-        },
+        Some(config_path) => Config::load_from_path(config_path).map_err(|error| {
+            std::io::Error::other(format!("Failed to load config file: {error}"))
+        })?,
         None => Config::load().unwrap_or_default(),
     };
 
@@ -344,6 +340,9 @@ fn create_cli_overrides(args: &ConvertArgs, matches: &ArgMatches) -> CliOverride
     }
     if is_command_line(matches, "rotation_action") {
         overrides.rotation_action = args.rotation_action;
+    }
+    if is_command_line(matches, "rotation_min_confidence") {
+        overrides.rotation_min_confidence = args.rotation_min_confidence;
     }
     if is_command_line(matches, "deskew_action") {
         overrides.deskew_action = args.deskew_action;
@@ -554,6 +553,10 @@ fn print_execution_plan(
     if config.geometry_only {
         println!("Geometry-only mode: ENABLED");
         println!("Rotation action: {}", config.rotation_action);
+        println!(
+            "Rotation minimum confidence: {}",
+            config.rotation_min_confidence
+        );
         println!("Deskew action: {}", config.deskew_action);
         println!();
         println!("Pipeline Configuration:");

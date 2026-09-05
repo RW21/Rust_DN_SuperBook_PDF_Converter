@@ -1601,7 +1601,7 @@ mod tests {
         let mut image = GrayImage::from_pixel(600, 800, Luma([255]));
         for y in 0..800 {
             for x in 0..600 {
-                if x < 34 || x >= 566 || y < 34 || y >= 766 {
+                if !(34..566).contains(&x) || !(34..766).contains(&y) {
                     image.put_pixel(x, y, Luma([0]));
                 }
             }

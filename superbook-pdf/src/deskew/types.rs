@@ -2,7 +2,9 @@
 //!
 //! Contains basic data structures for skew detection and correction.
 
+use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use thiserror::Error;
 
 // ============================================================
@@ -51,6 +53,68 @@ pub const DEFAULT_ROTATION_MAXIMUM_DENSE_ROW_FRACTION: f64 = 0.75;
 pub const DEFAULT_ROTATION_MINIMUM_APPLY_SCORE: f64 = 0.55;
 /// Default minimum confidence required to approve a 180-degree proposal.
 pub const DEFAULT_ROTATION_MINIMUM_APPLY_CONFIDENCE: f64 = 0.90;
+
+/// Validated minimum confidence for automatic 180-degree rotation.
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+pub struct RotationConfidenceThreshold(f64);
+
+impl RotationConfidenceThreshold {
+    pub fn new(value: f64) -> Result<Self> {
+        if value.is_finite() && (0.0..=1.0).contains(&value) {
+            Ok(Self(if value == 0.0 { 0.0 } else { value }))
+        } else {
+            Err(DeskewError::DetectionFailed(format!(
+                "rotation minimum confidence must be finite and in 0.0..=1.0, got {value}"
+            )))
+        }
+    }
+
+    pub const fn get(self) -> f64 {
+        self.0
+    }
+}
+
+impl Default for RotationConfidenceThreshold {
+    fn default() -> Self {
+        Self(DEFAULT_ROTATION_MINIMUM_APPLY_CONFIDENCE)
+    }
+}
+
+impl std::fmt::Display for RotationConfidenceThreshold {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl FromStr for RotationConfidenceThreshold {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        let parsed = value
+            .parse::<f64>()
+            .map_err(|error| format!("invalid rotation minimum confidence: {error}"))?;
+        Self::new(parsed).map_err(|error| error.to_string())
+    }
+}
+
+impl Serialize for RotationConfidenceThreshold {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_f64(self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for RotationConfidenceThreshold {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = f64::deserialize(deserializer)?;
+        Self::new(value).map_err(D::Error::custom)
+    }
+}
 
 // ============================================================
 // Error Types
@@ -793,6 +857,33 @@ mod tests {
         assert_eq!(options.border_crop_fraction(), 0.03);
         assert_eq!(options.minimum_dimension(), 64);
         assert_eq!(options.minimum_apply_confidence(), 0.90);
+    }
+
+    #[test]
+    fn rotation_confidence_threshold_is_validated_for_parse_and_serde() {
+        let default = RotationConfidenceThreshold::default();
+        assert_eq!(default.get(), 0.90);
+        assert_eq!(
+            "0".parse::<RotationConfidenceThreshold>().unwrap().get(),
+            0.0
+        );
+        assert_eq!(
+            "1".parse::<RotationConfidenceThreshold>().unwrap().get(),
+            1.0
+        );
+
+        for value in ["NaN", "inf", "-0.1", "1.1"] {
+            assert!(
+                value.parse::<RotationConfidenceThreshold>().is_err(),
+                "{value}"
+            );
+        }
+        for json in ["-0.1", "1.1", "null", "\"0.9\""] {
+            assert!(serde_json::from_str::<RotationConfidenceThreshold>(json).is_err());
+        }
+        let round_trip: RotationConfidenceThreshold =
+            serde_json::from_str(&serde_json::to_string(&default).unwrap()).unwrap();
+        assert_eq!(round_trip, default);
     }
 
     #[test]

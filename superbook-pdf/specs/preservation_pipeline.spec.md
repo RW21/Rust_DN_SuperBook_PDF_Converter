@@ -201,6 +201,45 @@ bilevel, metadata, or PDF-filter preservation claim.
 - Exact rotation preserves dimensions, color type, samples, channels, and alpha for
   representative 8-bit and 16-bit variants; two rotations restore the original.
 
+## Task 3B: Rotation Policy Configuration
+
+`--rotation-min-confidence` is available only with `--geometry-only`. Its value is a
+validated finite threshold in `0.0..=1.0`; NaN, infinities, and out-of-range values
+are rejected at CLI, TOML, Serde, and library boundaries. The default is 0.90.
+
+`processing.rotation_min_confidence` configures the same threshold. An explicitly
+provided CLI value overrides TOML; an omitted CLI value preserves TOML; otherwise the
+default applies. Dry-run output shows the effective threshold. Explicit configuration
+file read or parse errors are fatal instead of silently reverting to mutation-capable
+defaults. Errors from implicitly discovered legacy configuration retain the existing
+default-fallback behavior.
+
+## Task 3C: Rotation Policy Integration
+
+The coordinator assigns a zero-based physical page index before analysis. `off`
+performs no image read. `report` returns a `proposed` or `rejected` manifest-ready
+rotation outcome and never changes pixels. `apply` first returns an approved proposal;
+only a successful decoded-pixel transform finalizes its decision as `applied`. The
+immutable score floor, configured confidence threshold, reason, and ambiguity
+checks all approve the evidence. Upright evidence is `unchanged`; ambiguous or weak
+evidence is `rejected` and requires review. Analysis, copy, and transform failures
+propagate as typed pipeline failures instead of being silently treated as unchanged.
+
+The legacy pipeline remains gated by its legacy `deskew` switch, but rotation and
+deskew actions are checked independently inside that gate. Geometry-only execution
+continues to fail closed until the preservation writer can publish a complete
+physical-page manifest; Task 3 provides deterministic indexed outcomes and strict
+`RotationTransform` mapping without advertising an unwritten manifest.
+
+### Task 3 policy test cases
+
+- `off` returns without reading even a nonexistent image.
+- `report` maps approved 180-degree evidence to `proposed`, never `applied`.
+- `apply` leaves approved evidence as a proposal until a successful transform finalizes
+  it as `applied`; low-confidence or guarded evidence is rejected with
+  `review_required = true`.
+- Indexed outcomes retain the coordinator's physical page index.
+
 ### Transform manifest test cases
 
 - Serde round-trip preserves every schema field and snake-case decisions.

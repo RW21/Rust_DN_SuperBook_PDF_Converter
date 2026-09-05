@@ -36,10 +36,10 @@ mod types;
 pub use algorithm::ImageProcDeskewer;
 pub use types::{
     DeskewAlgorithm, DeskewError, DeskewOptions, DeskewOptionsBuilder, DeskewResult, Deskewer,
-    QualityMode, Result, RotationAnalysisOptions, RotationAnalysisOptionsBuilder, RotationEvidence,
-    RotationMetrics, RotationReason, SkewDetection, DEFAULT_BACKGROUND_COLOR, DEFAULT_MAX_ANGLE,
-    DEFAULT_ROTATION_BORDER_CROP_FRACTION, DEFAULT_ROTATION_MAXIMUM_DENSE_ROW_FRACTION,
-    DEFAULT_ROTATION_MAXIMUM_ILLUSTRATION_INK_RATIO,
+    QualityMode, Result, RotationAnalysisOptions, RotationAnalysisOptionsBuilder,
+    RotationConfidenceThreshold, RotationEvidence, RotationMetrics, RotationReason, SkewDetection,
+    DEFAULT_BACKGROUND_COLOR, DEFAULT_MAX_ANGLE, DEFAULT_ROTATION_BORDER_CROP_FRACTION,
+    DEFAULT_ROTATION_MAXIMUM_DENSE_ROW_FRACTION, DEFAULT_ROTATION_MAXIMUM_ILLUSTRATION_INK_RATIO,
     DEFAULT_ROTATION_MAXIMUM_LARGEST_COMPONENT_SHARE, DEFAULT_ROTATION_MINIMUM_APPLY_CONFIDENCE,
     DEFAULT_ROTATION_MINIMUM_APPLY_SCORE, DEFAULT_ROTATION_MINIMUM_CONTRAST,
     DEFAULT_ROTATION_MINIMUM_DIMENSION, DEFAULT_ROTATION_MINIMUM_GLYPH_COMPONENTS,

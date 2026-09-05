@@ -10,10 +10,12 @@
 //! - WarpAffine rotation with Lanczos interpolation
 
 use super::types::{
-    DeskewAlgorithm, DeskewError, DeskewOptions, DeskewResult, QualityMode, Result, SkewDetection,
-    ALPHA_OPAQUE, GRAYSCALE_THRESHOLD, WHITE_PIXEL,
+    DeskewAlgorithm, DeskewError, DeskewOptions, DeskewResult, QualityMode, Result,
+    RotationAnalysisOptions, RotationEvidence, RotationMetrics, RotationReason, SkewDetection,
+    ALPHA_OPAQUE, DEFAULT_ROTATION_MINIMUM_APPLY_SCORE, GRAYSCALE_THRESHOLD, WHITE_PIXEL,
 };
 use image::{DynamicImage, GenericImageView, GrayImage, Rgba};
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 
 // ============================================================
@@ -43,6 +45,230 @@ pub const HOUGH_RHO_RESOLUTION: f64 = 1.0;
 
 /// imageproc-based deskewer implementation
 pub struct ImageProcDeskewer;
+
+#[derive(Debug)]
+struct InkComponent {
+    area: usize,
+    min_x: usize,
+    max_x: usize,
+    min_y: usize,
+    max_y: usize,
+}
+
+impl InkComponent {
+    fn area(&self) -> usize {
+        self.area
+    }
+
+    fn width(&self) -> usize {
+        self.max_x - self.min_x + 1
+    }
+
+    fn height(&self) -> usize {
+        self.max_y - self.min_y + 1
+    }
+}
+
+fn histogram_percentile(histogram: &[u64; 256], total: u64, fraction: f64) -> u8 {
+    let target = ((total as f64 * fraction).ceil() as u64).max(1);
+    let mut cumulative = 0u64;
+    for (value, count) in histogram.iter().enumerate() {
+        cumulative += count;
+        if cumulative >= target {
+            return value as u8;
+        }
+    }
+    255
+}
+
+fn otsu_from_histogram(histogram: &[u64; 256], total: u64) -> u8 {
+    if total == 0 {
+        return 0;
+    }
+    let total_sum: u64 = histogram
+        .iter()
+        .enumerate()
+        .map(|(value, count)| value as u64 * count)
+        .sum();
+    let mut background_weight = 0u64;
+    let mut background_sum = 0u64;
+    let mut best_threshold = 0u8;
+    let mut maximum_variance = 0.0f64;
+    for (threshold, count) in histogram.iter().copied().enumerate() {
+        background_weight += count;
+        if background_weight == 0 {
+            continue;
+        }
+        let foreground_weight = total - background_weight;
+        if foreground_weight == 0 {
+            break;
+        }
+        background_sum += threshold as u64 * count;
+        let background_mean = background_sum as f64 / background_weight as f64;
+        let foreground_mean = (total_sum - background_sum) as f64 / foreground_weight as f64;
+        let variance = background_weight as f64
+            * foreground_weight as f64
+            * (background_mean - foreground_mean).powi(2);
+        if variance > maximum_variance {
+            maximum_variance = variance;
+            best_threshold = threshold as u8;
+        }
+    }
+    best_threshold
+}
+
+fn retained_components(
+    mask: &[bool],
+    width: u32,
+    height: u32,
+    minimum_area: usize,
+) -> (Vec<InkComponent>, Vec<bool>) {
+    let width = width as usize;
+    let height = height as usize;
+    let mut visited = vec![false; mask.len()];
+    let mut cleaned_mask = vec![false; mask.len()];
+    let mut components = Vec::new();
+    for start in 0..mask.len() {
+        if !mask[start] || visited[start] {
+            continue;
+        }
+        let mut queue = VecDeque::from([start]);
+        visited[start] = true;
+        let mut component = InkComponent {
+            area: 0,
+            min_x: width,
+            max_x: 0,
+            min_y: height,
+            max_y: 0,
+        };
+        // Buffer only until the component reaches the retention threshold.
+        // Retained components are written directly into the cleaned mask, so
+        // the detector never stores a second copy of every retained ink index.
+        let mut pending = Vec::with_capacity(minimum_area.saturating_sub(1));
+        while let Some(index) = queue.pop_front() {
+            component.area += 1;
+            if component.area < minimum_area {
+                pending.push(index);
+            } else if component.area == minimum_area {
+                for buffered in pending.drain(..) {
+                    cleaned_mask[buffered] = true;
+                }
+                cleaned_mask[index] = true;
+            } else {
+                cleaned_mask[index] = true;
+            }
+
+            let x = index % width;
+            let y = index / width;
+            component.min_x = component.min_x.min(x);
+            component.max_x = component.max_x.max(x);
+            component.min_y = component.min_y.min(y);
+            component.max_y = component.max_y.max(y);
+            let first_y = y.saturating_sub(1);
+            let last_y = y.saturating_add(1).min(height - 1);
+            let first_x = x.saturating_sub(1);
+            let last_x = x.saturating_add(1).min(width - 1);
+            for neighbor_y in first_y..=last_y {
+                for neighbor_x in first_x..=last_x {
+                    if neighbor_x == x && neighbor_y == y {
+                        continue;
+                    }
+                    let neighbor = neighbor_y * width + neighbor_x;
+                    if mask[neighbor] && !visited[neighbor] {
+                        visited[neighbor] = true;
+                        queue.push_back(neighbor);
+                    }
+                }
+            }
+        }
+        if component.area >= minimum_area {
+            components.push(component);
+        }
+    }
+    (components, cleaned_mask)
+}
+
+fn text_like_runs(mask: &[bool], width: u32, height: u32, horizontal: bool) -> (usize, f64) {
+    let (primary, secondary) = if horizontal {
+        (height, width)
+    } else {
+        (width, height)
+    };
+    let active_minimum = 3u32.max((secondary as f64 * 0.005).ceil() as u32);
+    let maximum_gap = (primary as f64 * 0.004).ceil() as u32;
+    let mut active = Vec::new();
+    for position in 0..primary {
+        let mut count = 0u32;
+        let mut minimum = secondary;
+        let mut maximum = 0u32;
+        for cross in 0..secondary {
+            let (x, y) = if horizontal {
+                (cross, position)
+            } else {
+                (position, cross)
+            };
+            if mask[y as usize * width as usize + x as usize] {
+                count += 1;
+                minimum = minimum.min(cross);
+                maximum = maximum.max(cross);
+            }
+        }
+        if count >= active_minimum {
+            active.push((position, count, minimum, maximum));
+        }
+    }
+    let active_fraction = active.len() as f64 / primary as f64;
+    let mut run_count = 0usize;
+    let mut cursor = 0usize;
+    while cursor < active.len() {
+        let start = active[cursor].0;
+        let mut end = start;
+        let mut minimum = active[cursor].2;
+        let mut maximum = active[cursor].3;
+        let mut ink = active[cursor].1 as u64;
+        cursor += 1;
+        while cursor < active.len() && active[cursor].0 - end <= maximum_gap + 1 {
+            end = active[cursor].0;
+            minimum = minimum.min(active[cursor].2);
+            maximum = maximum.max(active[cursor].3);
+            ink += active[cursor].1 as u64;
+            cursor += 1;
+        }
+        let thickness = end - start + 1;
+        let span = maximum - minimum + 1;
+        let thickness_fraction = thickness as f64 / primary as f64;
+        let span_fraction = span as f64 / secondary as f64;
+        let density = ink as f64 / (u64::from(thickness) * u64::from(span)) as f64;
+        if (0.004..=0.05).contains(&thickness_fraction)
+            && span_fraction >= 0.20
+            && (0.03..=0.65).contains(&density)
+        {
+            run_count += 1;
+        }
+    }
+    (run_count, active_fraction)
+}
+
+fn count_band_ink(mask: &[bool], width: u32, start: u32, end: u32) -> u64 {
+    let mut count = 0u64;
+    for y in start..end {
+        let row_start = y as usize * width as usize;
+        count += mask[row_start..row_start + width as usize]
+            .iter()
+            .filter(|pixel| **pixel)
+            .count() as u64;
+    }
+    count
+}
+
+fn normalized_band_difference(top: u64, bottom: u64, minimum_support: u64) -> Option<f64> {
+    let total = u128::from(top) + u128::from(bottom);
+    if total < u128::from(minimum_support) || total == 0 {
+        return None;
+    }
+    let difference = bottom as f64 - top as f64;
+    Some((difference / total as f64).clamp(-1.0, 1.0))
+}
 
 impl ImageProcDeskewer {
     /// Detect skew angle from image
@@ -434,86 +660,276 @@ impl ImageProcDeskewer {
             .collect()
     }
 
-    /// Detect if an image is rotated 180 degrees by comparing ink density
-    /// in the top vs bottom portions of the page.
-    ///
-    /// For text documents, the top portion typically has more content (title, headers)
-    /// than the bottom. If the bottom has significantly more ink, the page is likely
-    /// upside down.
-    ///
-    /// Returns `true` if the image appears to be rotated 180 degrees.
-    pub fn detect_upside_down(image_path: &Path) -> std::result::Result<bool, DeskewError> {
-        let img = image::open(image_path).map_err(|e| DeskewError::InvalidFormat(e.to_string()))?;
-        let gray = img.to_luma8();
-        Ok(Self::is_upside_down(&gray))
+    /// Analyze a decoded image file for conservative 0/180-degree rotation evidence.
+    pub fn analyze_rotation(
+        image_path: &Path,
+        options: &RotationAnalysisOptions,
+    ) -> Result<RotationEvidence> {
+        if !image_path.exists() {
+            return Err(DeskewError::ImageNotFound(image_path.to_path_buf()));
+        }
+        let image = image::open(image_path)
+            .map_err(|error| DeskewError::InvalidFormat(error.to_string()))?;
+        Self::analyze_rotation_image(&image, options)
     }
 
-    /// Check if a grayscale image is upside down by ink density analysis.
-    fn is_upside_down(gray: &GrayImage) -> bool {
-        let (_width, height) = gray.dimensions();
-        if height < 20 {
-            return false;
+    /// Analyze an in-memory image without mutating or re-encoding it.
+    pub fn analyze_rotation_image(
+        image: &DynamicImage,
+        options: &RotationAnalysisOptions,
+    ) -> Result<RotationEvidence> {
+        options.validate()?;
+        let (width, height) = image.dimensions();
+        if width < options.minimum_dimension() || height < options.minimum_dimension() {
+            return RotationEvidence::try_new(
+                0,
+                0.0,
+                0.0,
+                RotationReason::ImageTooSmall,
+                true,
+                RotationMetrics::default(),
+            );
         }
 
-        let threshold = Self::otsu_threshold(gray);
+        let gray = image.to_luma8();
+        // Flooring keeps `2 * crop < dimension` for every validated fraction
+        // below 0.5. Ceiling can over-crop odd, near-minimum images and
+        // underflow the unsigned subtraction below.
+        let crop_x = (width as f64 * options.border_crop_fraction()).floor() as u32;
+        let crop_y = (height as f64 * options.border_crop_fraction()).floor() as u32;
+        let cropped_width = width - 2 * crop_x;
+        let cropped_height = height - 2 * crop_y;
+        if cropped_width == 0 || cropped_height == 0 {
+            return RotationEvidence::try_new(
+                0,
+                0.0,
+                0.0,
+                RotationReason::ImageTooSmall,
+                true,
+                RotationMetrics::default(),
+            );
+        }
 
-        // Compare ink density in top 25% vs bottom 25%
-        let quarter = height / 4;
-        let top_ink = Self::count_ink_pixels(gray, 0, quarter, threshold);
-        let bottom_ink = Self::count_ink_pixels(gray, height - quarter, height, threshold);
+        let pixel_count = u64::from(cropped_width) * u64::from(cropped_height);
+        let mask_len = usize::try_from(pixel_count).map_err(|_| {
+            DeskewError::DetectionFailed(
+                "rotation analysis image is too large for this platform".to_string(),
+            )
+        })?;
+        let mut histogram = [0u64; 256];
+        for y in crop_y..height - crop_y {
+            for x in crop_x..width - crop_x {
+                histogram[gray.get_pixel(x, y).0[0] as usize] += 1;
+            }
+        }
+        // Use a low enough tail percentile to retain genuinely sparse marks for
+        // the explicit sparse-page guard. A 0.5% cutoff misclassified pages
+        // with a few text lines as uniform white before ink analysis ran.
+        let low = histogram_percentile(&histogram, pixel_count, 0.001);
+        let high = histogram_percentile(&histogram, pixel_count, 0.995);
+        let robust_contrast = high.saturating_sub(low);
+        let otsu_threshold = otsu_from_histogram(&histogram, pixel_count);
+        if robust_contrast < options.minimum_contrast() {
+            let metrics = RotationMetrics::new(
+                otsu_threshold,
+                robust_contrast,
+                0.0,
+                0,
+                0,
+                0.0,
+                0.0,
+                0.0,
+                None,
+                None,
+            )?;
+            return RotationEvidence::try_new(
+                0,
+                0.0,
+                0.0,
+                RotationReason::BlankPage,
+                false,
+                metrics,
+            );
+        }
 
-        // Also check top 10% vs bottom 10% for header/footer detection
-        let tenth = height / 10;
-        let top_10_ink = Self::count_ink_pixels(gray, 0, tenth, threshold);
-        let bottom_10_ink = Self::count_ink_pixels(gray, height - tenth, height, threshold);
-
-        // Heuristic: if bottom has significantly more ink than top in BOTH
-        // quarter and tenth regions, likely upside down.
-        // Using ratio > 2.0 as threshold to avoid false positives.
-        let quarter_ratio = if top_ink > 0 {
-            bottom_ink as f64 / top_ink as f64
-        } else if bottom_ink > 0 {
-            10.0 // Top is empty, bottom has ink → likely upside down
+        let threshold = otsu_threshold.min(high.saturating_sub(16));
+        let mut raw_mask = vec![false; mask_len];
+        for y in 0..cropped_height {
+            for x in 0..cropped_width {
+                raw_mask[y as usize * cropped_width as usize + x as usize] =
+                    gray.get_pixel(x + crop_x, y + crop_y).0[0] <= threshold;
+            }
+        }
+        let speckle_minimum = 2usize.max((pixel_count as f64 * 0.000_001).ceil() as usize);
+        let (retained, cleaned_mask) =
+            retained_components(&raw_mask, cropped_width, cropped_height, speckle_minimum);
+        let cleaned_ink = retained
+            .iter()
+            .map(|component| component.area() as u64)
+            .sum::<u64>();
+        let cleaned_ink_ratio = cleaned_ink as f64 / pixel_count as f64;
+        let largest_component = retained
+            .iter()
+            .map(|component| component.area() as u64)
+            .max()
+            .unwrap_or(0);
+        let largest_component_share = if cleaned_ink == 0 {
+            0.0
         } else {
-            1.0 // Both empty
+            largest_component as f64 / cleaned_ink as f64
         };
+        let glyph_maximum_area = (pixel_count as f64 * 0.001).floor() as usize;
+        let glyph_component_count = retained
+            .iter()
+            .filter(|component| {
+                let aspect = component.width() as f64 / component.height() as f64;
+                component.area() <= glyph_maximum_area
+                    && component.width() as f64 <= cropped_width as f64 * 0.08
+                    && component.height() as f64 <= cropped_height as f64 * 0.05
+                    && (0.1..=10.0).contains(&aspect)
+            })
+            .count();
+        let (text_line_count, active_row_fraction) =
+            text_like_runs(&cleaned_mask, cropped_width, cropped_height, true);
+        let (vertical_line_count, _) =
+            text_like_runs(&cleaned_mask, cropped_width, cropped_height, false);
 
-        let tenth_ratio = if top_10_ink > 0 {
-            bottom_10_ink as f64 / top_10_ink as f64
-        } else if bottom_10_ink > 0 {
-            10.0
-        } else {
-            1.0
-        };
-
-        // Must have strong evidence from both checks
-        quarter_ratio > 2.0 && tenth_ratio > 1.5
-    }
-
-    /// Count dark (ink) pixels in a horizontal band of the image.
-    fn count_ink_pixels(gray: &GrayImage, y_start: u32, y_end: u32, threshold: u8) -> u64 {
-        let (width, _) = gray.dimensions();
-        let mut count = 0u64;
-        for y in y_start..y_end {
+        let frame_x = 1u32.max((width as f64 * 0.05).ceil() as u32);
+        let frame_y = 1u32.max((height as f64 * 0.05).ceil() as u32);
+        let mut frame_ink = 0u64;
+        let mut frame_pixels = 0u64;
+        for y in 0..height {
             for x in 0..width {
-                if gray.get_pixel(x, y).0[0] < threshold {
-                    count += 1;
+                if x < frame_x || x >= width - frame_x || y < frame_y || y >= height - frame_y {
+                    frame_pixels += 1;
+                    if gray.get_pixel(x, y).0[0] <= threshold {
+                        frame_ink += 1;
+                    }
                 }
             }
         }
-        count
+        let outer_frame_ink_density = frame_ink as f64 / frame_pixels as f64;
+
+        let mirrored_bands = |start: f64, end: f64| {
+            let start = (cropped_height as f64 * start).floor() as u32;
+            let end = (cropped_height as f64 * end).floor() as u32;
+            let mirrored_start = cropped_height - end;
+            let mirrored_end = cropped_height - start;
+            (
+                count_band_ink(&cleaned_mask, cropped_width, start, end),
+                count_band_ink(&cleaned_mask, cropped_width, mirrored_start, mirrored_end),
+                end - start,
+            )
+        };
+        let (broad_top, broad_bottom, broad_band_height) = mirrored_bands(0.05, 0.35);
+        let broad_area = u64::from(cropped_width) * u64::from(2 * broad_band_height);
+        let broad_support = 32u64.max((broad_area as f64 * 0.001).ceil() as u64);
+        let broad_difference = normalized_band_difference(broad_top, broad_bottom, broad_support);
+
+        let (outer_top, outer_bottom, outer_band_height) = mirrored_bands(0.05, 0.20);
+        let outer_area = u64::from(cropped_width) * u64::from(2 * outer_band_height);
+        let outer_support = 32u64.max((outer_area as f64 * 0.001).ceil() as u64);
+        let outer_difference = normalized_band_difference(outer_top, outer_bottom, outer_support);
+        let score = match (broad_difference, outer_difference) {
+            (Some(broad), Some(outer)) => (0.65 * broad + 0.35 * outer).clamp(-1.0, 1.0),
+            (Some(broad), None) => broad,
+            (None, Some(outer)) => outer,
+            (None, None) => 0.0,
+        };
+        let proposed_degrees = if score > 0.0 { 180 } else { 0 };
+        let metrics = RotationMetrics::new(
+            otsu_threshold,
+            robust_contrast,
+            cleaned_ink_ratio,
+            glyph_component_count,
+            text_line_count,
+            largest_component_share,
+            active_row_fraction,
+            outer_frame_ink_density,
+            broad_difference,
+            outer_difference,
+        )?;
+        let guarded = |reason| {
+            RotationEvidence::try_new(proposed_degrees, score, 0.0, reason, true, metrics.clone())
+        };
+
+        if cleaned_ink_ratio < options.minimum_ink_ratio() {
+            return RotationEvidence::try_new(
+                0,
+                0.0,
+                0.0,
+                RotationReason::BlankPage,
+                false,
+                metrics,
+            );
+        }
+        if outer_frame_ink_density >= 0.12 && cleaned_ink_ratio >= 0.02 {
+            return guarded(RotationReason::CoverLike);
+        }
+        if vertical_line_count >= options.minimum_text_lines()
+            && text_line_count < options.minimum_text_lines()
+        {
+            return guarded(RotationReason::NonHorizontalLayout);
+        }
+        if cleaned_ink_ratio >= options.maximum_illustration_ink_ratio()
+            || largest_component_share >= options.maximum_largest_component_share()
+            || (active_row_fraction >= options.maximum_dense_row_fraction()
+                && text_line_count < options.minimum_text_lines())
+        {
+            return guarded(RotationReason::IllustrationLike);
+        }
+        if cleaned_ink_ratio < options.sparse_ink_ratio()
+            || glyph_component_count < options.minimum_glyph_components()
+            || text_line_count < options.minimum_text_lines()
+        {
+            return guarded(RotationReason::SparsePage);
+        }
+        let (Some(broad), Some(outer)) = (broad_difference, outer_difference) else {
+            return guarded(RotationReason::InsufficientBandSupport);
+        };
+        if broad.signum() != outer.signum() || broad.abs() < 0.20 || outer.abs() < 0.20 {
+            return guarded(RotationReason::BandDisagreement);
+        }
+
+        let strength = ((score.abs() - 0.25) / 0.35).clamp(0.0, 1.0);
+        let agreement = ((broad.abs().min(outer.abs()) - 0.20) / 0.30).clamp(0.0, 1.0);
+        let evidence = (text_line_count as f64 / 12.0)
+            .min(glyph_component_count as f64 / 120.0)
+            .min(cleaned_ink_ratio / 0.02)
+            .min(1.0);
+        let confidence = strength.min(agreement).min(evidence);
+        let reason = if score >= DEFAULT_ROTATION_MINIMUM_APPLY_SCORE {
+            RotationReason::UpsideDownEvidence
+        } else if score <= -DEFAULT_ROTATION_MINIMUM_APPLY_SCORE {
+            RotationReason::UprightEvidence
+        } else {
+            RotationReason::InsufficientOrientationEvidence
+        };
+        RotationEvidence::try_new(proposed_degrees, score, confidence, reason, false, metrics)
     }
 
-    /// Correct 180-degree rotation by flipping the image.
-    pub fn correct_upside_down(
-        image_path: &Path,
-        output_path: &Path,
-    ) -> std::result::Result<(), DeskewError> {
-        let img = image::open(image_path).map_err(|e| DeskewError::InvalidFormat(e.to_string()))?;
-        let rotated = img.rotate180();
-        rotated
+    /// Compatibility wrapper using the default conservative auto-apply policy.
+    pub fn detect_upside_down(image_path: &Path) -> Result<bool> {
+        let options = RotationAnalysisOptions::default();
+        let evidence = Self::analyze_rotation(image_path, &options)?;
+        Ok(evidence.is_auto_applicable(options.minimum_apply_confidence()))
+    }
+
+    /// Rotate decoded pixels by exactly 180 degrees without interpolation or conversion.
+    pub fn rotate_180_exact(image: &DynamicImage) -> DynamicImage {
+        image.rotate180()
+    }
+
+    /// Compatibility file writer. This does not preserve source encoding or metadata.
+    pub fn correct_upside_down(image_path: &Path, output_path: &Path) -> Result<()> {
+        if !image_path.exists() {
+            return Err(DeskewError::ImageNotFound(image_path.to_path_buf()));
+        }
+        let image = image::open(image_path)
+            .map_err(|error| DeskewError::InvalidFormat(error.to_string()))?;
+        Self::rotate_180_exact(&image)
             .save(output_path)
-            .map_err(|e| DeskewError::CorrectionFailed(e.to_string()))?;
+            .map_err(|error| DeskewError::CorrectionFailed(error.to_string()))?;
         Ok(())
     }
 
@@ -1134,7 +1550,111 @@ impl ImageProcDeskewer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::{ImageBuffer, Luma, LumaA, Rgb, RgbaImage};
     use tempfile::tempdir;
+
+    fn synthetic_text_page() -> DynamicImage {
+        let mut image = GrayImage::from_pixel(600, 800, Luma([255]));
+        let rows = [
+            45, 56, 67, 78, 89, 100, 111, 122, 133, 144, 190, 220, 250, 270, 650, 700,
+        ];
+        for (line, y) in rows.into_iter().enumerate() {
+            for glyph in 0..20 {
+                let x = 50 + glyph * 25;
+                let width = 6 + ((line + glyph as usize) % 3) as u32;
+                for yy in y..y + 6 {
+                    for xx in x..x + width {
+                        image.put_pixel(xx, yy, Luma([0]));
+                    }
+                }
+            }
+        }
+        DynamicImage::ImageLuma8(image)
+    }
+
+    fn sparse_page() -> DynamicImage {
+        let mut image = GrayImage::from_pixel(600, 800, Luma([255]));
+        for y in [610, 650, 690] {
+            for glyph in 0..10 {
+                let x = 180 + glyph * 24;
+                for yy in y..y + 6 {
+                    for xx in x..x + 8 {
+                        image.put_pixel(xx, yy, Luma([0]));
+                    }
+                }
+            }
+        }
+        DynamicImage::ImageLuma8(image)
+    }
+
+    fn illustration_page() -> DynamicImage {
+        let mut image = GrayImage::from_pixel(600, 800, Luma([255]));
+        for y in 440..760 {
+            for x in 90..510 {
+                image.put_pixel(x, y, Luma([0]));
+            }
+        }
+        DynamicImage::ImageLuma8(image)
+    }
+
+    fn cover_page() -> DynamicImage {
+        let mut image = GrayImage::from_pixel(600, 800, Luma([255]));
+        for y in 0..800 {
+            for x in 0..600 {
+                if x < 34 || x >= 566 || y < 34 || y >= 766 {
+                    image.put_pixel(x, y, Luma([0]));
+                }
+            }
+        }
+        for (x0, y0, x1, y1) in [
+            (100, 140, 500, 190),
+            (130, 240, 470, 290),
+            (180, 590, 420, 720),
+        ] {
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    image.put_pixel(x, y, Luma([0]));
+                }
+            }
+        }
+        DynamicImage::ImageLuma8(image)
+    }
+
+    fn vertical_page() -> DynamicImage {
+        let mut image = GrayImage::from_pixel(600, 800, Luma([255]));
+        for column in 0..8 {
+            let x0 = 80 + column * 60;
+            for y in 100..700 {
+                if ((y + column * 7) / 6) % 2 == 0 {
+                    for x in x0..x0 + 8 {
+                        image.put_pixel(x, y, Luma([0]));
+                    }
+                }
+            }
+        }
+        DynamicImage::ImageLuma8(image)
+    }
+
+    fn assert_exact_rotation(image: DynamicImage, bytes_per_pixel: usize) {
+        let dimensions = image.dimensions();
+        let color = image.color();
+        let original = image.as_bytes().to_vec();
+        let rotated = ImageProcDeskewer::rotate_180_exact(&image);
+        assert_eq!(rotated.dimensions(), dimensions);
+        assert_eq!(rotated.color(), color);
+
+        let expected: Vec<u8> = original
+            .chunks_exact(bytes_per_pixel)
+            .rev()
+            .flat_map(|pixel| pixel.iter().copied())
+            .collect();
+        assert_eq!(rotated.as_bytes(), expected);
+
+        let restored = ImageProcDeskewer::rotate_180_exact(&rotated);
+        assert_eq!(restored.color(), color);
+        assert_eq!(restored.dimensions(), dimensions);
+        assert_eq!(restored.as_bytes(), original);
+    }
 
     #[test]
     fn test_image_not_found() {
@@ -1538,6 +2058,217 @@ mod tests {
         assert!(
             center_pixel.0[0] < 150,
             "Center should be dark after rotation"
+        );
+    }
+
+    #[test]
+    fn rotation_band_difference_is_bounded_and_handles_zero_support() {
+        assert_eq!(normalized_band_difference(0, 0, 1), None);
+        assert_eq!(normalized_band_difference(100, 300, 1), Some(0.5));
+        for (top, bottom) in [(0, 100), (100, 0), (u64::MAX, u64::MAX)] {
+            let difference = normalized_band_difference(top, bottom, 1).unwrap();
+            assert!(difference.is_finite());
+            assert!((-1.0..=1.0).contains(&difference));
+        }
+    }
+
+    #[test]
+    fn rotation_analysis_detects_strong_synthetic_text_orientation() {
+        let options = RotationAnalysisOptions::default();
+        let upright = synthetic_text_page();
+        let upright_evidence =
+            ImageProcDeskewer::analyze_rotation_image(&upright, &options).unwrap();
+        assert_eq!(upright_evidence.proposed_degrees(), 0);
+        assert!(upright_evidence.score() <= -0.55, "{upright_evidence:?}");
+        assert!(
+            upright_evidence.confidence() >= 0.90,
+            "{upright_evidence:?}"
+        );
+        assert_eq!(upright_evidence.reason(), RotationReason::UprightEvidence);
+        assert!(!upright_evidence.ambiguity_guard());
+        assert!(!upright_evidence.is_auto_applicable(0.90));
+
+        let upside_down = ImageProcDeskewer::rotate_180_exact(&upright);
+        let upside_down_evidence =
+            ImageProcDeskewer::analyze_rotation_image(&upside_down, &options).unwrap();
+        assert_eq!(upside_down_evidence.proposed_degrees(), 180);
+        assert!(
+            upside_down_evidence.score() >= 0.55,
+            "{upside_down_evidence:?}"
+        );
+        assert!(
+            upside_down_evidence.confidence() >= 0.90,
+            "{upside_down_evidence:?}"
+        );
+        assert_eq!(
+            upside_down_evidence.reason(),
+            RotationReason::UpsideDownEvidence
+        );
+        assert!(!upside_down_evidence.ambiguity_guard());
+        assert!(upside_down_evidence.is_auto_applicable(0.90));
+        assert_eq!(upright_evidence.score(), -upside_down_evidence.score());
+    }
+
+    #[test]
+    fn rotation_analysis_abstains_on_blank_uniform_and_tiny_images() {
+        let options = RotationAnalysisOptions::default();
+        for value in [0, 127, 255] {
+            let image = DynamicImage::ImageLuma8(GrayImage::from_pixel(600, 800, Luma([value])));
+            let evidence = ImageProcDeskewer::analyze_rotation_image(&image, &options).unwrap();
+            assert_eq!(evidence.proposed_degrees(), 0);
+            assert_eq!(evidence.score(), 0.0);
+            assert_eq!(evidence.confidence(), 0.0);
+            assert_eq!(evidence.reason(), RotationReason::BlankPage);
+            assert!(!evidence.is_auto_applicable(0.0));
+        }
+
+        let tiny = DynamicImage::ImageLuma8(GrayImage::from_pixel(63, 100, Luma([0])));
+        let evidence = ImageProcDeskewer::analyze_rotation_image(&tiny, &options).unwrap();
+        assert_eq!(evidence.reason(), RotationReason::ImageTooSmall);
+        assert!(evidence.ambiguity_guard());
+    }
+
+    #[test]
+    fn rotation_analysis_near_half_border_crop_does_not_underflow() {
+        let options = RotationAnalysisOptions::builder()
+            .border_crop_fraction(0.499)
+            .build()
+            .unwrap();
+        let image = DynamicImage::ImageLuma8(GrayImage::from_pixel(65, 65, Luma([255])));
+
+        let evidence = ImageProcDeskewer::analyze_rotation_image(&image, &options).unwrap();
+
+        assert_eq!(evidence.reason(), RotationReason::BlankPage);
+        assert!(!evidence.is_auto_applicable(0.0));
+    }
+
+    #[test]
+    fn rotation_analysis_guards_sparse_illustration_cover_and_vertical_pages() {
+        let options = RotationAnalysisOptions::default();
+        let cases = [
+            (sparse_page(), RotationReason::SparsePage),
+            (illustration_page(), RotationReason::IllustrationLike),
+            (cover_page(), RotationReason::CoverLike),
+            (vertical_page(), RotationReason::NonHorizontalLayout),
+        ];
+        for (image, expected_reason) in cases {
+            let evidence = ImageProcDeskewer::analyze_rotation_image(&image, &options).unwrap();
+            assert_eq!(evidence.reason(), expected_reason, "{evidence:?}");
+            assert!(evidence.ambiguity_guard(), "{evidence:?}");
+            assert_eq!(evidence.confidence(), 0.0);
+            assert!(!evidence.is_auto_applicable(0.0));
+        }
+    }
+
+    #[test]
+    fn rotation_analysis_is_deterministic_and_metrics_are_bounded() {
+        let image = ImageProcDeskewer::rotate_180_exact(&synthetic_text_page());
+        let options = RotationAnalysisOptions::default();
+        let first = ImageProcDeskewer::analyze_rotation_image(&image, &options).unwrap();
+        let second = ImageProcDeskewer::analyze_rotation_image(&image, &options).unwrap();
+        assert_eq!(first, second);
+        assert!(first.score().is_finite());
+        assert!((-1.0..=1.0).contains(&first.score()));
+        assert!(first.confidence().is_finite());
+        assert!((0.0..=1.0).contains(&first.confidence()));
+        assert!(first.metrics().broad_band_difference().unwrap().is_finite());
+        assert!(first.metrics().outer_band_difference().unwrap().is_finite());
+    }
+
+    #[test]
+    fn compatibility_wrapper_uses_default_conservative_policy() {
+        let directory = tempdir().unwrap();
+        let upside_down_path = directory.path().join("upside-down.png");
+        ImageProcDeskewer::rotate_180_exact(&synthetic_text_page())
+            .save(&upside_down_path)
+            .unwrap();
+
+        assert!(ImageProcDeskewer::detect_upside_down(&upside_down_path).unwrap());
+        for (name, image) in [
+            (
+                "uniform-black",
+                DynamicImage::ImageLuma8(GrayImage::from_pixel(600, 800, Luma([0]))),
+            ),
+            (
+                "uniform-gray",
+                DynamicImage::ImageLuma8(GrayImage::from_pixel(600, 800, Luma([127]))),
+            ),
+            (
+                "blank",
+                DynamicImage::ImageLuma8(GrayImage::from_pixel(600, 800, Luma([255]))),
+            ),
+            (
+                "tiny",
+                DynamicImage::ImageLuma8(GrayImage::from_pixel(63, 100, Luma([0]))),
+            ),
+            ("sparse", sparse_page()),
+            ("illustration", illustration_page()),
+            ("cover", cover_page()),
+            ("vertical", vertical_page()),
+        ] {
+            let path = directory.path().join(format!("{name}.png"));
+            image.save(&path).unwrap();
+            assert!(
+                !ImageProcDeskewer::detect_upside_down(&path).unwrap(),
+                "compatibility wrapper approved {name}"
+            );
+        }
+        let path_evidence = ImageProcDeskewer::analyze_rotation(
+            &upside_down_path,
+            &RotationAnalysisOptions::default(),
+        )
+        .unwrap();
+        assert!(path_evidence.is_auto_applicable(0.90));
+    }
+
+    #[test]
+    fn exact_rotation_preserves_representative_8_and_16_bit_variants() {
+        assert_exact_rotation(
+            DynamicImage::ImageLuma8(ImageBuffer::from_raw(3, 2, (0..6).collect()).unwrap()),
+            1,
+        );
+        assert_exact_rotation(
+            DynamicImage::ImageLumaA8(
+                ImageBuffer::<LumaA<u8>, _>::from_raw(3, 2, (0..12).collect()).unwrap(),
+            ),
+            2,
+        );
+        assert_exact_rotation(
+            DynamicImage::ImageRgb8(
+                ImageBuffer::<Rgb<u8>, _>::from_raw(3, 2, (0..18).collect()).unwrap(),
+            ),
+            3,
+        );
+        assert_exact_rotation(
+            DynamicImage::ImageRgba8(RgbaImage::from_raw(3, 2, (0..24).collect()).unwrap()),
+            4,
+        );
+        assert_exact_rotation(
+            DynamicImage::ImageLuma16(
+                ImageBuffer::from_raw(3, 2, (0..6).map(|v| v * 1000).collect()).unwrap(),
+            ),
+            2,
+        );
+        assert_exact_rotation(
+            DynamicImage::ImageLumaA16(
+                ImageBuffer::<LumaA<u16>, _>::from_raw(3, 2, (0..12).map(|v| v * 1000).collect())
+                    .unwrap(),
+            ),
+            4,
+        );
+        assert_exact_rotation(
+            DynamicImage::ImageRgb16(
+                ImageBuffer::<Rgb<u16>, _>::from_raw(3, 2, (0..18).map(|v| v * 1000).collect())
+                    .unwrap(),
+            ),
+            6,
+        );
+        assert_exact_rotation(
+            DynamicImage::ImageRgba16(
+                ImageBuffer::<Rgba<u16>, _>::from_raw(3, 2, (0..24).map(|v| v * 1000).collect())
+                    .unwrap(),
+            ),
+            8,
         );
     }
 }

@@ -171,7 +171,15 @@ pub use config::{
 };
 pub use deskew::{
     DeskewAlgorithm, DeskewError, DeskewOptions, DeskewOptionsBuilder, DeskewResult,
-    ImageProcDeskewer, QualityMode, SkewDetection,
+    ImageProcDeskewer, QualityMode, RotationAnalysisOptions, RotationAnalysisOptionsBuilder,
+    RotationEvidence, RotationMetrics, RotationReason, SkewDetection,
+    DEFAULT_ROTATION_BORDER_CROP_FRACTION, DEFAULT_ROTATION_MAXIMUM_DENSE_ROW_FRACTION,
+    DEFAULT_ROTATION_MAXIMUM_ILLUSTRATION_INK_RATIO,
+    DEFAULT_ROTATION_MAXIMUM_LARGEST_COMPONENT_SHARE, DEFAULT_ROTATION_MINIMUM_APPLY_CONFIDENCE,
+    DEFAULT_ROTATION_MINIMUM_APPLY_SCORE, DEFAULT_ROTATION_MINIMUM_CONTRAST,
+    DEFAULT_ROTATION_MINIMUM_DIMENSION, DEFAULT_ROTATION_MINIMUM_GLYPH_COMPONENTS,
+    DEFAULT_ROTATION_MINIMUM_INK_RATIO, DEFAULT_ROTATION_MINIMUM_TEXT_LINES,
+    DEFAULT_ROTATION_SPARSE_INK_RATIO,
 };
 pub use image_extract::{
     ColorSpace, ExtractError, ExtractOptions, ExtractOptionsBuilder, ExtractedPage, ImageFormat,

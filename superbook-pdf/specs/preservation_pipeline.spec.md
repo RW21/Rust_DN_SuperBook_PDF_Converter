@@ -152,6 +152,55 @@ Task 2 does not add rotation or deskew evidence algorithms. Those stages remain 
 responsibility of Tasks 3 and 4; workers must eventually return indexed outcomes
 to a coordinator rather than write JSONL concurrently.
 
+## Task 3A: Conservative Rotation Analysis
+
+Task 3A adds analysis and exact in-memory 180-degree rotation only. It does not
+integrate rotation evidence into the pipeline, CLI, configuration, manifest, Markdown,
+or preservation writer.
+
+`RotationAnalysisOptions` is validated before analysis. Fraction and confidence
+values must be finite and in `0.0..=1.0`; dimensions, contrast, and evidence-count
+minimums must be nonzero where required. Conservative defaults include a 3% analysis
+border crop, a minimum dimension of 64 pixels, and minimum auto-apply confidence of
+0.90.
+
+`analyze_rotation(path, options)` and `analyze_rotation_image(image, options)` return
+validated `RotationEvidence`. Proposed degrees are limited to 0 or 180, score is
+finite in `-1.0..=1.0`, confidence is finite in `0.0..=1.0`, reasons are stable
+snake-case values, and an ambiguity guard is a hard auto-apply veto. The default
+auto-apply policy requires a 180-degree proposal, the immutable score safety floor of
+0.55, confidence at least 0.90, an `upside_down_evidence` reason, and no ambiguity
+guard. The compatibility `detect_upside_down` wrapper returns true only when that
+policy approves the evidence.
+
+Analysis is deterministic and operates on a grayscale copy. It excludes a symmetric
+border, uses robust contrast plus Otsu thresholding, removes speckle components, and
+measures ink, glyph-like components, horizontal text-like lines, unsupported vertical
+layout, outer-frame density, and broad plus outer mirrored bands. Blank, tiny, sparse,
+cover-like, illustration-like, and vertical pages abstain. Missing band support,
+band disagreement, weak score, or weak confidence also fail closed.
+
+`rotate_180_exact` is a decoded-pixel coordinate permutation with no interpolation,
+canvas expansion, fill, thresholding, color conversion, or alpha manipulation. It
+preserves representative 8-bit and 16-bit grayscale, grayscale-alpha, RGB, and RGBA
+`DynamicImage` variants; applying it twice is pixel-identical. The legacy path-based
+`correct_upside_down` remains compatibility behavior and is not an archival or
+encoded-format-preserving operation. In particular, Task 3A makes no JPEG, indexed,
+bilevel, metadata, or PDF-filter preservation claim.
+
+### Task 3A test cases
+
+- Options reject non-finite, out-of-range, and structurally invalid values.
+- Evidence construction enforces finite bounded score/confidence and 0/180 proposals.
+- Auto-apply policy uses inclusive score/confidence boundaries and ambiguity veto.
+- Synthetic upright and exactly rotated text pages produce strong opposite evidence.
+- Synthetic blank, uniform, tiny, sparse, illustration, cover, and vertical pages
+  abstain and are never approved by the compatibility wrapper.
+- Repeated analysis is exactly deterministic and all returned numeric evidence is
+  finite and bounded.
+- Exact rotation preserves dimensions, color type, samples, channels, and alpha for
+  representative 8-bit and 16-bit variants; two rotations restore the original.
+
 ### Transform manifest test cases
 
 - Serde round-trip preserves every schema field and snake-case decisions.
